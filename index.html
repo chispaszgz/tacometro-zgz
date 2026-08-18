@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tacómetro ZgZ — Consola USB</title>
+<style>
+  :root{
+    --bg:#f4f2ec; --panel:#fff; --texto:#1f1f1d; --suave:#5f5e5a;
+    --borde:#d9d6cd; --acento:#1d6f9e; --ok:#2f7d32; --mal:#b3261e; --mono:ui-monospace,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --bg:#16171a; --panel:#1e2024; --texto:#e8e6e1; --suave:#9d9b96;
+           --borde:#33363c; --acento:#5aa9d6; --ok:#7ec981; --mal:#f08b84; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:24px;background:var(--bg);color:var(--texto);
+       font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+  .envoltorio{max-width:900px;margin:0 auto}
+  h1{font-size:20px;margin:0}
+  h2{font-size:15px;margin:0 0 12px;color:var(--suave);text-transform:uppercase;letter-spacing:.06em}
+  header{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+  .estado{margin-left:auto;display:flex;align-items:center;gap:8px;font-size:14px;color:var(--suave)}
+  .punto{width:10px;height:10px;border-radius:50%;background:var(--mal)}
+  .punto.on{background:var(--ok)}
+  section{background:var(--panel);border:1px solid var(--borde);border-radius:10px;
+          padding:16px;margin-bottom:16px}
+  button{font:inherit;padding:8px 14px;border-radius:7px;border:1px solid var(--borde);
+         background:var(--panel);color:var(--texto);cursor:pointer}
+  button:hover:not(:disabled){border-color:var(--acento)}
+  button:disabled{opacity:.45;cursor:default}
+  button.principal{background:var(--acento);border-color:var(--acento);color:#fff}
+  input{font:inherit;padding:7px 10px;border-radius:7px;border:1px solid var(--borde);
+        background:var(--bg);color:var(--texto);width:100%}
+  .rejilla{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px 20px}
+  .dato{display:flex;justify-content:space-between;gap:12px;padding:5px 0;
+        border-bottom:1px dotted var(--borde);font-size:14px}
+  .dato span:first-child{color:var(--suave)}
+  .dato span:last-child{font-family:var(--mono);text-align:right;word-break:break-all}
+  .campo{display:grid;grid-template-columns:110px 1fr auto;gap:10px;align-items:center;margin-bottom:10px}
+  .campo label{color:var(--suave);font-size:14px}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th{text-align:left;color:var(--suave);font-weight:500;font-size:13px;
+     padding:6px 8px;border-bottom:1px solid var(--borde)}
+  td{padding:7px 8px;border-bottom:1px solid var(--borde);font-family:var(--mono)}
+  td.acciones{text-align:right;font-family:inherit;white-space:nowrap}
+  td button{padding:4px 9px;font-size:13px;margin-left:5px}
+  .vacio{color:var(--suave);font-style:italic;padding:14px 0;text-align:center}
+  pre#consola{margin:0;max-height:220px;overflow:auto;font-family:var(--mono);
+              font-size:12px;line-height:1.45;color:var(--suave);white-space:pre-wrap;word-break:break-all}
+  .aviso{padding:12px 14px;border-radius:8px;border:1px solid var(--mal);
+         color:var(--mal);margin-bottom:16px;font-size:14px}
+  .oculto{display:none}
+  .barra{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center}
+  .nota{font-size:13px;color:var(--suave)}
+  .nota.aldia{color:var(--ok)}
+  .nota.nueva{color:var(--acento);font-weight:500}
+  tr.detalle td{background:var(--bg);padding:16px}
+  .detalleCaja{display:grid;grid-template-columns:minmax(200px,1fr) 2fr;gap:20px;align-items:start}
+  @media (max-width:700px){ .detalleCaja{grid-template-columns:1fr} }
+  .veredicto{font-family:inherit;font-weight:600;padding:7px 11px;border-radius:7px;
+             margin-bottom:12px;font-size:14px;text-align:center}
+  .veredicto.pasa{background:rgba(47,125,50,.14);color:var(--ok)}
+  .veredicto.falla{background:rgba(179,38,30,.14);color:var(--mal)}
+  .detalleCaja .dato{font-size:13px}
+  svg.curva{width:100%;height:auto;display:block}
+</style>
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js"></script>
+</head>
+<body>
+<div class="envoltorio">
+
+  <header>
+    <h1>Tacómetro ZgZ</h1>
+    <button id="btnConectar" class="principal">Conectar</button>
+    <button id="btnDesconectar" disabled>Desconectar</button>
+    <div class="estado"><div class="punto" id="punto"></div><span id="txtEstado">Sin conectar</span></div>
+  </header>
+
+  <div id="sinSoporte" class="aviso oculto"></div>
+
+  <section id="panelInfo" class="oculto">
+    <h2>Dispositivo</h2>
+    <div class="rejilla" id="datosInfo"></div>
+    <div class="barra"><button id="btnRefrescar">Actualizar</button></div>
+  </section>
+
+  <section id="panelCfg" class="oculto">
+    <h2>Configuración</h2>
+    <div class="campo"><label for="fId">ID</label><input id="fId" maxlength="20"><button data-cmd="SETID" data-campo="fId">Guardar</button></div>
+    <div class="campo"><label for="fAgente">Agente</label><input id="fAgente" maxlength="16"><button data-cmd="SETAG" data-campo="fAgente">Guardar</button></div>
+    <div class="campo"><label for="fNota">Nota</label><input id="fNota" maxlength="22"><button data-cmd="SETNOTA" data-campo="fNota">Guardar</button></div>
+    <div class="dato"><span>Impresora seleccionada</span><span id="vImpresora">—</span></div>
+  </section>
+
+  <section id="panelPruebas" class="oculto">
+    <h2>Pruebas guardadas</h2>
+    <table><thead><tr><th>Archivo</th><th>Tamaño</th><th></th></tr></thead>
+      <tbody id="tablaPruebas"></tbody></table>
+    <div id="sinPruebas" class="vacio oculto">No hay pruebas almacenadas</div>
+    <div class="barra">
+      <button id="btnListar">Actualizar lista</button>
+      <button id="btnTodas">Descargar todas</button>
+    </div>
+  </section>
+
+  <section id="panelFw">
+    <h2>Firmware</h2>
+    <div class="dato"><span>En el aparato</span><span id="fwActual">— (conecta para saberlo)</span></div>
+    <div class="dato"><span>Disponible</span><span id="fwDisponible">—</span></div>
+    <div id="fwEstado" class="nota">Comprobando versión publicada…</div>
+    <div class="barra">
+      <esp-web-install-button id="btnGrabar" manifest="firmware/manifest.json">
+        <button slot="activate" class="principal">Grabar firmware</button>
+        <span slot="unsupported" class="nota">Este navegador no permite grabar. Usa Chrome o Edge de escritorio.</span>
+        <span slot="not-allowed" class="nota">Hace falta servir la página por HTTPS o desde localhost.</span>
+      </esp-web-install-button>
+      <span id="fwBloqueo" class="nota oculto">Desconecta primero: el grabador necesita el puerto en exclusiva.</span>
+    </div>
+    <div class="nota" style="margin-top:12px">
+      Se graban sólo el gestor de arranque, la tabla de particiones y la aplicación.
+      <strong>La partición de datos no se toca, así que las pruebas guardadas se conservan.</strong>
+    </div>
+  </section>
+
+  <section>
+    <h2>Consola</h2>
+    <pre id="consola">Pulsa «Conectar» y elige el puerto del tacómetro.</pre>
+    <div class="barra"><button id="btnLimpiar">Limpiar</button></div>
+  </section>
+
+</div>
+
+<script>
+"use strict";
+
+let puerto = null, lector = null, escritor = null;
+let restoLinea = "";
+const pendientes = [];
+let ultimaInfo = null;
+
+const $ = id => document.getElementById(id);
+
+function log(txt, clase) {
+  const c = $("consola");
+  c.textContent += (c.textContent ? "\n" : "") + txt;
+  c.scrollTop = c.scrollHeight;
+}
+
+function estado(conectado, texto) {
+  $("punto").classList.toggle("on", conectado);
+  $("txtEstado").textContent = texto;
+  $("btnConectar").disabled = conectado;
+  $("btnDesconectar").disabled = !conectado;
+  for (const p of ["panelInfo", "panelCfg", "panelPruebas"])
+    $(p).classList.toggle("oculto", !conectado);
+
+  // El grabador abre el puerto por su cuenta y necesita tenerlo en exclusiva,
+  // asi que mientras la consola lo ocupe se bloquea el boton.
+  const activar = document.querySelector('#btnGrabar button[slot="activate"]');
+  if (activar) activar.disabled = conectado;
+  $("fwBloqueo").classList.toggle("oculto", !conectado);
+}
+
+// --- Conexión ---------------------------------------------------------
+async function conectar() {
+  try {
+    puerto = await navigator.serial.requestPort();
+    await puerto.open({ baudRate: 115200 });
+
+    // CRÍTICO: en el USB-Serial-JTAG del ESP32 estas dos líneas van conectadas
+    // por dentro al reset y al arranque. Si se dejan activas, la placa puede
+    // quedarse en modo descarga y sólo la recupera desenchufar el cable.
+    await puerto.setSignals({ dataTerminalReady: false, requestToSend: false });
+
+    escritor = puerto.writable.getWriter();
+    estado(true, "Conectado");
+    log("· puerto abierto");
+    bucleLectura();
+    await refrescarTodo();
+  } catch (e) {
+    if (e.name !== "NotFoundError") log("✗ " + e.message);
+  }
+}
+
+async function desconectar() {
+  try {
+    if (lector) { await lector.cancel(); lector = null; }
+    if (escritor) { escritor.releaseLock(); escritor = null; }
+    if (puerto) { await puerto.close(); puerto = null; }
+  } catch (e) { log("✗ al cerrar: " + e.message); }
+  estado(false, "Sin conectar");
+  log("· puerto cerrado");
+}
+
+async function bucleLectura() {
+  const dec = new TextDecoder();
+  try {
+    lector = puerto.readable.getReader();
+    while (true) {
+      const { value, done } = await lector.read();
+      if (done) break;
+      restoLinea += dec.decode(value, { stream: true });
+      let i;
+      while ((i = restoLinea.indexOf("\n")) >= 0) {
+        const linea = restoLinea.slice(0, i).replace(/\r$/, "");
+        restoLinea = restoLinea.slice(i + 1);
+        if (linea.trim()) procesarLinea(linea.trim());
+      }
+    }
+  } catch (e) {
+    log("✗ lectura: " + e.message);
+  } finally {
+    if (lector) { try { lector.releaseLock(); } catch (_) {} }
+  }
+}
+
+// El firmware escribe también trazas de depuración por el mismo puerto, así
+// que se ignora todo lo que no sea JSON en lugar de intentar silenciarlas.
+function procesarLinea(linea) {
+  if (!linea.startsWith("{")) { log("  " + linea); return; }
+  let obj;
+  try { obj = JSON.parse(linea); } catch (_) { log("  " + linea); return; }
+  log("← " + linea.slice(0, 160) + (linea.length > 160 ? "…" : ""));
+  const p = pendientes.shift();
+  if (p) { clearTimeout(p.temporizador); p.resolver(obj); }
+}
+
+function enviar(orden, msEspera = 5000) {
+  if (!escritor) return Promise.reject(new Error("sin conexión"));
+  return new Promise((resolver, rechazar) => {
+    const item = { resolver, rechazar };
+    item.temporizador = setTimeout(() => {
+      const i = pendientes.indexOf(item);
+      if (i >= 0) pendientes.splice(i, 1);
+      rechazar(new Error("sin respuesta a « " + orden + " »"));
+    }, msEspera);
+    pendientes.push(item);
+    log("→ " + orden);
+    escritor.write(new TextEncoder().encode(orden + "\n")).catch(e => {
+      clearTimeout(item.temporizador);
+      rechazar(e);
+    });
+  });
+}
+
+// --- Paneles ----------------------------------------------------------
+const ETIQUETAS = {
+  id: "Identificador", fw: "Firmware", build: "Compilado", mac: "MAC",
+  chip: "Chip", rev: "Revisión", cpuMHz: "CPU (MHz)", proto: "Protocolo",
+  flash: "Flash", heap: "RAM libre", fsTotal: "Almacén total",
+  fsUsado: "Almacén usado", pruebas: "Pruebas"
+};
+const BYTES = new Set(["flash", "heap", "fsTotal", "fsUsado"]);
+
+function humano(n) {
+  if (n >= 1048576) return (n / 1048576).toFixed(2) + " MB";
+  if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
+  return n + " B";
+}
+
+// --- Firmware ---------------------------------------------------------
+let fwPublicado = null;
+
+// Compara versiones tipo 1.2.10 numéricamente: "1.2.10" es posterior a "1.2.9",
+// cosa que una comparación de textos se tragaría al revés.
+function comparaVersion(a, b) {
+  const pa = String(a).split(".").map(n => parseInt(n, 10) || 0);
+  const pb = String(b).split(".").map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] || 0, y = pb[i] || 0;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+async function cargarManifiesto() {
+  try {
+    const r = await fetch("firmware/manifest.json", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    fwPublicado = (await r.json()).version;
+    $("fwDisponible").textContent = fwPublicado;
+  } catch (e) {
+    $("fwDisponible").textContent = "no disponible";
+    $("fwEstado").textContent = "No se pudo leer el manifiesto: " + e.message;
+  }
+  compararFirmware();
+}
+
+function compararFirmware() {
+  const enAparato = ultimaInfo && ultimaInfo.fw;
+  const est = $("fwEstado");
+  est.className = "nota";
+  if (!enAparato) { est.textContent = "Conecta el tacómetro para comparar versiones."; return; }
+  if (!fwPublicado) { est.textContent = "Sin versión publicada con la que comparar."; return; }
+  const c = comparaVersion(enAparato, fwPublicado);
+  if (c < 0) { est.classList.add("nueva"); est.textContent = "Hay una versión más reciente disponible."; }
+  else if (c === 0) { est.classList.add("aldia"); est.textContent = "El aparato está al día. Puedes regrabar igualmente si va mal."; }
+  else est.textContent = "El aparato lleva una versión más nueva que la publicada aquí.";
+}
+
+function pintarInfo(d) {
+  ultimaInfo = d;
+  $("fwActual").textContent = d.fw + "  (" + d.build + ")";
+  compararFirmware();
+  const cont = $("datosInfo");
+  cont.innerHTML = "";
+  for (const [clave, etiqueta] of Object.entries(ETIQUETAS)) {
+    if (d[clave] === undefined) continue;
+    const valor = BYTES.has(clave) ? humano(d[clave]) : d[clave];
+    const div = document.createElement("div");
+    div.className = "dato";
+    const a = document.createElement("span"); a.textContent = etiqueta;
+    const b = document.createElement("span"); b.textContent = valor;
+    div.append(a, b);
+    cont.append(div);
+  }
+}
+
+function pintarCfg(d) {
+  $("fId").value = d.id || "";
+  $("fAgente").value = d.agente || "";
+  $("fNota").value = d.nota || "";
+  $("vImpresora").textContent = d.impresora === "cable" ? "Cable (serie TTL)" : "Bluetooth (BLE)";
+}
+
+function pintarPruebas(lista) {
+  const cuerpo = $("tablaPruebas");
+  cuerpo.innerHTML = "";
+  $("sinPruebas").classList.toggle("oculto", lista.length > 0);
+  $("btnTodas").disabled = lista.length === 0;
+  for (const p of lista) {
+    const tr = document.createElement("tr");
+    const tdN = document.createElement("td"); tdN.textContent = p.n;
+    const tdB = document.createElement("td"); tdB.textContent = humano(p.b);
+    const tdA = document.createElement("td"); tdA.className = "acciones";
+
+    const bV = document.createElement("button");
+    bV.textContent = "Ver";
+    bV.onclick = () => verPrueba(p.n, tr, bV);
+
+    const bD = document.createElement("button");
+    bD.textContent = "Descargar";
+    bD.onclick = () => descargar(p.n);
+
+    const bB = document.createElement("button");
+    bB.textContent = "Borrar";
+    bB.onclick = () => borrar(p.n);
+
+    tdA.append(bV, bD, bB);
+    tr.append(tdN, tdB, tdA);
+    cuerpo.append(tr);
+  }
+}
+
+// --- Acciones ---------------------------------------------------------
+async function refrescarTodo() {
+  try {
+    pintarInfo(await enviar("INFO"));
+    pintarCfg(await enviar("CFG"));
+    await listar();
+  } catch (e) { log("✗ " + e.message); }
+}
+
+async function listar() {
+  try {
+    const r = await enviar("LIST", 8000);
+    pintarPruebas(r.pruebas || []);
+  } catch (e) { log("✗ " + e.message); }
+}
+
+// --- Ver una prueba ---------------------------------------------------
+// Límite legal de los VMP en España. Cámbialo si el aparato se usa para otra
+// categoría de vehículo; sólo afecta a la línea de referencia y al veredicto.
+const LIMITE_KMH = 25;
+
+const ETIQ_META = {
+  agente: "Agente", nota: "Nota", fecha: "Fecha", hora: "Hora",
+  lat: "Latitud", lon: "Longitud", duracion_s: "Duración (s)",
+  vmax_pico_kmh: "V. máx pico (km/h)", vmax_5s_kmh: "V. máx 5 s (km/h)"
+};
+
+function parsearCsv(texto) {
+  const meta = {}, puntos = [];
+  let enCurva = false;
+  for (const bruta of texto.split("\n")) {
+    const l = bruta.trim();
+    if (!l) continue;
+    const i = l.indexOf(",");
+    if (i < 0) continue;
+    const clave = l.slice(0, i), valor = l.slice(i + 1);
+    if (clave === "t_s") { enCurva = true; continue; }
+    if (enCurva) {
+      const t = parseFloat(clave), v = parseFloat(valor);
+      if (!isNaN(t) && !isNaN(v)) puntos.push({ t, v });
+    } else meta[clave] = valor;
+  }
+  return { meta, puntos };
+}
+
+// Gráfica en SVG generada a mano: sin librerías externas, así la página
+// sigue funcionando sin conexión y no hay nada que mantener al día.
+function graficaSvg(puntos) {
+  const W = 600, H = 210, mIzq = 38, mAb = 26, mArr = 12, mDer = 10;
+  const x0 = mIzq, y0 = H - mAb, an = W - mIzq - mDer, al = H - mArr - mAb;
+
+  const tMax = Math.max(1, ...puntos.map(p => p.t));
+  const vTope = Math.max(LIMITE_KMH, ...puntos.map(p => p.v));
+  const vMax = Math.max(5, Math.ceil(vTope / 5) * 5);
+
+  const px = t => x0 + (t / tMax) * an;
+  const py = v => y0 - (v / vMax) * al;
+
+  let s = `<svg class="curva" viewBox="0 0 ${W} ${H}" role="img" aria-label="Curva de velocidad">`;
+  // Rejilla y etiquetas del eje Y
+  for (let v = 0; v <= vMax; v += 5) {
+    const y = py(v).toFixed(1);
+    s += `<line x1="${x0}" y1="${y}" x2="${x0 + an}" y2="${y}" stroke="currentColor" stroke-opacity=".14"/>`;
+    s += `<text x="${x0 - 6}" y="${y}" text-anchor="end" dominant-baseline="middle" font-size="10" fill="currentColor" fill-opacity=".6">${v}</text>`;
+  }
+  // Etiquetas del eje X cada 5 s
+  for (let t = 0; t <= tMax; t += 5) {
+    const x = px(t).toFixed(1);
+    s += `<text x="${x}" y="${y0 + 15}" text-anchor="middle" font-size="10" fill="currentColor" fill-opacity=".6">${t}</text>`;
+  }
+  // Línea del límite legal
+  const yl = py(LIMITE_KMH).toFixed(1);
+  s += `<line x1="${x0}" y1="${yl}" x2="${x0 + an}" y2="${yl}" stroke="#b3261e" stroke-width="1.5" stroke-dasharray="6 4"/>`;
+  s += `<text x="${x0 + an}" y="${yl - 5}" text-anchor="end" font-size="10" fill="#b3261e">límite ${LIMITE_KMH} km/h</text>`;
+  // Ejes y curva
+  s += `<line x1="${x0}" y1="${mArr}" x2="${x0}" y2="${y0}" stroke="currentColor" stroke-opacity=".45"/>`;
+  s += `<line x1="${x0}" y1="${y0}" x2="${x0 + an}" y2="${y0}" stroke="currentColor" stroke-opacity=".45"/>`;
+  const pts = puntos.map(p => `${px(p.t).toFixed(1)},${py(p.v).toFixed(1)}`).join(" ");
+  s += `<polyline points="${pts}" fill="none" stroke="#1d6f9e" stroke-width="2" stroke-linejoin="round"/>`;
+  s += `<text x="${x0 + an / 2}" y="${H - 2}" text-anchor="middle" font-size="10" fill="currentColor" fill-opacity=".6">tiempo (s)</text>`;
+  return s + `</svg>`;
+}
+
+function construirDetalle(meta, puntos) {
+  const caja = document.createElement("div");
+  caja.className = "detalleCaja";
+
+  const izq = document.createElement("div");
+  const pico = parseFloat(meta.vmax_pico_kmh);
+  if (!isNaN(pico)) {
+    const v = document.createElement("div");
+    const supera = pico > LIMITE_KMH;
+    v.className = "veredicto " + (supera ? "falla" : "pasa");
+    v.textContent = supera
+      ? `Supera el límite: ${pico.toFixed(1)} km/h`
+      : `Dentro del límite: ${pico.toFixed(1)} km/h`;
+    izq.append(v);
+  }
+  for (const [clave, etiqueta] of Object.entries(ETIQ_META)) {
+    if (meta[clave] === undefined || meta[clave] === "") continue;
+    const d = document.createElement("div");
+    d.className = "dato";
+    const a = document.createElement("span"); a.textContent = etiqueta;
+    const b = document.createElement("span"); b.textContent = meta[clave];
+    d.append(a, b);
+    izq.append(d);
+  }
+
+  const der = document.createElement("div");
+  if (puntos.length > 1) der.innerHTML = graficaSvg(puntos);
+  else { const p = document.createElement("div"); p.className = "nota";
+         p.textContent = "Esta prueba no tiene curva registrada."; der.append(p); }
+
+  caja.append(izq, der);
+  return caja;
+}
+
+async function verPrueba(nombre, fila, boton) {
+  const sig = fila.nextElementSibling;
+  if (sig && sig.classList.contains("detalle")) {   // ya desplegada: se pliega
+    sig.remove(); boton.textContent = "Ver"; return;
+  }
+  boton.disabled = true;
+  const antes = boton.textContent;
+  boton.textContent = "…";
+  try {
+    const texto = new TextDecoder().decode(await pedirCsv(nombre));
+    const { meta, puntos } = parsearCsv(texto);
+    const tr = document.createElement("tr");
+    tr.className = "detalle";
+    const td = document.createElement("td");
+    td.colSpan = 3;
+    td.append(construirDetalle(meta, puntos));
+    tr.append(td);
+    fila.after(tr);
+    boton.textContent = "Ocultar";
+  } catch (e) {
+    log("✗ " + e.message);
+    boton.textContent = antes;
+  } finally { boton.disabled = false; }
+}
+
+async function pedirCsv(nombre) {
+  const r = await enviar("GET " + nombre, 15000);
+  if (!r.ok) throw new Error(r.error || "no se pudo leer");
+  const bin = atob(r.b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  if (r.b !== undefined && r.b !== bytes.length)
+    log("⚠ " + nombre + ": esperaba " + r.b + " B y llegaron " + bytes.length);
+  return bytes;
+}
+
+function guardarArchivo(nombre, bytes) {
+  const url = URL.createObjectURL(new Blob([bytes], { type: "text/csv" }));
+  const a = document.createElement("a");
+  a.href = url; a.download = nombre;
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function descargar(nombre) {
+  try { guardarArchivo(nombre, await pedirCsv(nombre)); log("✓ descargado " + nombre); }
+  catch (e) { log("✗ " + e.message); }
+}
+
+async function descargarTodas() {
+  // Excluye las filas desplegadas: su celda tambien es la primera de su fila
+  const filas = [...$("tablaPruebas").querySelectorAll("tr:not(.detalle) td:first-child")];
+  for (const f of filas) {
+    await descargar(f.textContent);
+    await new Promise(r => setTimeout(r, 300));   // respiro entre transferencias
+  }
+}
+
+async function borrar(nombre) {
+  if (!confirm("¿Borrar « " + nombre + " » del tacómetro?\n\nEsta acción no se puede deshacer.")) return;
+  try {
+    const r = await enviar("DEL " + nombre);
+    if (!r.ok) throw new Error(r.error || "no se pudo borrar");
+    log("✓ borrado " + nombre);
+    await listar();
+    pintarInfo(await enviar("INFO"));
+  } catch (e) { log("✗ " + e.message); }
+}
+
+// --- Arranque ---------------------------------------------------------
+$("btnConectar").onclick = conectar;
+$("btnDesconectar").onclick = desconectar;
+$("btnRefrescar").onclick = refrescarTodo;
+$("btnListar").onclick = listar;
+$("btnTodas").onclick = descargarTodas;
+$("btnLimpiar").onclick = () => { $("consola").textContent = ""; };
+
+for (const b of document.querySelectorAll("button[data-cmd]")) {
+  b.onclick = async () => {
+    const valor = $(b.dataset.campo).value.trim();
+    try {
+      pintarCfg(await enviar(b.dataset.cmd + " " + valor));
+      log("✓ guardado");
+    } catch (e) { log("✗ " + e.message); }
+  };
+}
+
+if (!("serial" in navigator)) {
+  const a = $("sinSoporte");
+  a.classList.remove("oculto");
+  a.textContent = location.protocol === "file:"
+    ? "Esta página está abierta como archivo local (file://) y Web Serial exige un contexto seguro. Sírvela desde http://localhost o por HTTPS."
+    : "Este navegador no admite Web Serial. Usa Chrome o Edge de escritorio.";
+  $("btnConectar").disabled = true;
+}
+estado(false, "Sin conectar");
+cargarManifiesto();
+</script>
+</body>
+</html>

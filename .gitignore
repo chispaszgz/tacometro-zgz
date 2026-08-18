@@ -1,0 +1,10 @@
+# Artefactos de compilacion de Arduino
+build/
+*.elf
+*.map
+
+# Modelos 3D y capturas del proyecto: pesan cientos de MB y no son codigo
+*.stl
+*.step
+*.stp
+*.zip
