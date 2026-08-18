@@ -64,10 +64,57 @@
   .veredicto.falla{background:rgba(179,38,30,.14);color:var(--mal)}
   .detalleCaja .dato{font-size:13px}
   svg.curva{width:100%;height:auto;display:block}
+
+  /* --- Pantalla de acceso --- */
+  #acceso{position:fixed;inset:0;z-index:100;background:var(--bg);display:flex;
+          align-items:center;justify-content:center;padding:24px}
+  .tarjeta{background:var(--panel);border:1px solid var(--borde);border-radius:14px;
+           padding:28px;width:100%;max-width:400px;text-align:center}
+  .tarjeta svg{width:100%;max-width:300px;height:auto;margin:0 auto 18px;display:block;color:var(--texto)}
+  .tarjeta h1{font-size:22px;margin:0 0 4px}
+  .tarjeta .lema{font-size:13px;color:var(--suave);margin:0 0 22px}
+  .tarjeta label{display:block;text-align:left;font-size:13px;color:var(--suave);margin:0 0 5px}
+  .tarjeta input{margin-bottom:14px}
+  .tarjeta button{width:100%;padding:10px}
+  #errorAcceso{margin-top:14px;color:var(--mal);font-size:14px}
 </style>
 <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js"></script>
 </head>
 <body>
+<div id="acceso">
+  <form class="tarjeta" id="formAcceso" autocomplete="off">
+    <svg viewBox="0 0 320 200" role="img" aria-label="Patinete sobre un banco de rodillos">
+  <line x1="20" y1="178" x2="300" y2="178" stroke="currentColor" stroke-opacity=".25" stroke-width="2"/>
+  <rect x="176" y="162" width="96" height="9" rx="3" fill="currentColor" fill-opacity=".18"/>
+  <rect x="96" y="131" width="42" height="40" rx="3" fill="currentColor" fill-opacity=".12"/>
+  <circle cx="200" cy="140" r="20" fill="none" stroke="#1d6f9e" stroke-width="3"/>
+  <circle cx="200" cy="140" r="4" fill="#1d6f9e"/>
+  <circle cx="248" cy="140" r="20" fill="none" stroke="#1d6f9e" stroke-width="3"/>
+  <circle cx="248" cy="140" r="4" fill="#1d6f9e"/>
+  <path d="M182 116a20 20 0 0 1 6-11" fill="none" stroke="#1d6f9e" stroke-width="2" stroke-opacity=".55" stroke-linecap="round"/>
+  <path d="M230 116a20 20 0 0 1 6-11" fill="none" stroke="#1d6f9e" stroke-width="2" stroke-opacity=".55" stroke-linecap="round"/>
+  <circle cx="224" cy="112" r="17" fill="none" stroke="currentColor" stroke-width="3.5"/>
+  <circle cx="224" cy="112" r="3" fill="currentColor"/>
+  <circle cx="115" cy="114" r="17" fill="none" stroke="currentColor" stroke-width="3.5"/>
+  <circle cx="115" cy="114" r="3" fill="currentColor"/>
+  <rect x="120" y="100" width="88" height="9" rx="4" fill="currentColor"/>
+  <path d="M206 105l14 5" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"/>
+  <path d="M124 102l-6-4" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"/>
+  <path d="M118 99L104 46" stroke="currentColor" stroke-width="4" stroke-linecap="round"/>
+  <path d="M84 44h40" stroke="currentColor" stroke-width="4" stroke-linecap="round"/>
+  <path d="M84 44h9M115 44h9" stroke="currentColor" stroke-width="7" stroke-linecap="round" stroke-opacity=".55"/>
+</svg>
+    <h1>Tac&oacute;metro ZgZ</h1>
+    <p class="lema">Verificaci&oacute;n de velocidad en VMP</p>
+    <label for="usuario">Usuario</label>
+    <input id="usuario" autocomplete="username" required>
+    <label for="clave">Contrase&ntilde;a</label>
+    <input id="clave" type="password" autocomplete="current-password" required>
+    <button type="submit" class="principal">Entrar</button>
+    <div id="errorAcceso" class="oculto">Usuario o contrase&ntilde;a incorrectos</div>
+  </form>
+</div>
+
 <div class="envoltorio">
 
   <header>
@@ -567,6 +614,45 @@ if (!("serial" in navigator)) {
 }
 estado(false, "Sin conectar");
 cargarManifiesto();
+
+// --- Acceso -----------------------------------------------------------
+// AVISO: esta comprobacion vive entera en el navegador, sobre una pagina
+// publica. Cualquiera puede leer este codigo y saltarsela. Es un cartel de
+// "no pasar", no una medida de seguridad: no protege nada de verdad.
+// El hash evita publicar la contrasena literal, pero no la hace secreta.
+// Para generar otro:  await sha256("nueva")  en la consola del navegador.
+const USUARIO = "policiachiprana";
+const CLAVE_SHA256 = "8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92";
+
+async function sha256(txt) {
+  const b = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(txt));
+  return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join("");
+}
+
+function entrar() {
+  const c = $("acceso");
+  if (c) c.remove();
+}
+
+$("formAcceso").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const err = $("errorAcceso");
+  try {
+    const ok = $("usuario").value.trim().toLowerCase() === USUARIO &&
+               (await sha256($("clave").value)) === CLAVE_SHA256;
+    if (!ok) { err.classList.remove("oculto"); $("clave").value = ""; $("clave").focus(); return; }
+    sessionStorage.setItem("tacoAcceso", "1");
+    entrar();
+  } catch (e) {
+    err.textContent = "No se pudo comprobar: " + e.message;
+    err.classList.remove("oculto");
+  }
+});
+
+// Se recuerda mientras la pestana siga abierta, para no repetirlo en cada recarga
+if (sessionStorage.getItem("tacoAcceso") === "1") entrar();
+else $("usuario").focus();
+
 </script>
 </body>
 </html>
