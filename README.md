@@ -43,6 +43,7 @@ almacenadas se conservan** al actualizar.
 | `DEL <nombre>` | borra una prueba |
 | `CFG` | agente, nota y tipo de impresora |
 | `SETID` / `SETAG` / `SETNOTA` | escritura de esos campos |
+| `SETIMP cable|bluetooth` | elige la impresora |
 
 Las trazas de depuración del firmware salen por el mismo puerto, así que
 cualquier línea que no empiece por `{` debe ignorarse.

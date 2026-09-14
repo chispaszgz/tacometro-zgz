@@ -335,7 +335,7 @@ ImpresoraSerie impresoraSerie;
 
 // --- SELECCION DE IMPRESORA (pantalla de opciones, se recuerda en la NVS) ---
 // El enum TipoImpresora esta declarado arriba del todo, junto a los #include.
-TipoImpresora tipoImpresora = IMP_BLUETOOTH;
+TipoImpresora tipoImpresora = IMP_CABLE;
 Impresora*    impresora     = &impresoraBLE;
 Preferences   prefs;
 
@@ -358,7 +358,7 @@ char notaPrueba[MAX_NOTA + 1]     = "";
 // FW_VERSION la cambias tu en cada version publicada; PROTO_VERSION solo
 // cuando el formato de las respuestas JSON deje de ser compatible, para que
 // la webapp pueda avisar en vez de fallar de forma rara.
-#define FW_VERSION    "1.0.0"
+#define FW_VERSION    "1.1.0"
 #define PROTO_VERSION 1
 #define MAX_ID_DISP   20
 char idDispositivo[MAX_ID_DISP + 1] = "";
@@ -877,31 +877,24 @@ void mostrarEspera() {
     snprintf(buf, sizeof(buf), "GPS: buscando (%d sat)",
              (int)gps.satellites.value());
   }
-  u8g2.drawStr(0, 8, buf);
+  u8g2.drawStr(0, 9, buf);
 
-  // --- TIEMPO ---
-  // El dia y la fecha van en 4x6 porque con "Miercoles" la linea no cabe en
-  // 5x7; y la hora tampoco entra detras, asi que baja a su propio renglon.
-  u8g2.setFont(u8g2_font_4x6_tf);
+  // --- FECHA y HORA ---
+  // "FECHA: Miercoles 23/02/26" son 25 caracteres: el maximo que entra en 5x7.
   if (gpsFix) {
     calcularHoraLocal();
-    snprintf(buf, sizeof(buf), "TIEMPO: %s %02d/%02d/%02d",
+    snprintf(buf, sizeof(buf), "FECHA: %s %02d/%02d/%02d",
              nombreDiaSemana(localDiaSemana), localDia, localMes, localAnio % 100);
-    u8g2.drawStr(0, 19, buf);
-    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", localHora, localMin, localSeg);
-    u8g2.drawStr(32, 27, buf);
+    u8g2.drawStr(0, 21, buf);
+    snprintf(buf, sizeof(buf), "HORA:  %02d:%02d:%02d", localHora, localMin, localSeg);
+    u8g2.drawStr(0, 34, buf);
   } else {
-    u8g2.drawStr(0, 19, "TIEMPO: sin senal");
+    u8g2.drawStr(0, 21, "FECHA: --/--/--");
+    u8g2.drawStr(0, 34, "HORA:  --:--:--");
   }
 
-  // --- AGENTE ---
-  u8g2.setFont(u8g2_font_5x7_tf);
-  snprintf(buf, sizeof(buf), "Agente: %s",
-           nombreAgente[0] ? nombreAgente : "(sin definir)");
-  u8g2.drawStr(0, 38, buf);
-
   u8g2.drawFrame(0, 44, 128, 1);
-  const char* pie = "VERDE=PRUEBA  AZUL=MENU";
+  const char* pie = "VERDE=PRUEBA  AZUL=HIST";
   u8g2.drawStr((128 - u8g2.getStrWidth(pie)) / 2, 56, pie);
 
   u8g2.sendBuffer();
@@ -965,6 +958,8 @@ const char* editTitulo = "";
 
 void volverAEspera() {
   guardarOpciones();
+  digitalWrite(pinLedRojo, 0);
+  digitalWrite(pinLedAzul, 0);
   editCampo = nullptr;
   histDetalle = -1;
   teclado.desconectar();
@@ -1199,7 +1194,7 @@ void mostrarHistorico() {
   }
 
   u8g2.setFont(u8g2_font_4x6_tf);
-  const char* pie = "corto=bajar largo=ver ROJO=salir";
+  const char* pie = "rojo=salir corto=bajar largo=ver";
   u8g2.drawStr((128 - u8g2.getStrWidth(pie)) / 2, 63, pie);
   u8g2.sendBuffer();
 }
@@ -1251,6 +1246,7 @@ void mostrarPerifericos() {
 //   SETID <texto>     cambia el identificador del aparato
 //   SETAG <texto>     cambia el agente
 //   SETNOTA <texto>   cambia la nota
+//   SETIMP <tipo>     cambia la impresora: "cable" o "bluetooth"
 #define MAX_CMD 96
 
 static const char B64[] =
@@ -1440,6 +1436,15 @@ void ejecutarComando(char* linea) {
     prefs.putString("nota", notaPrueba);
     cmdCfg();
   }
+  else if (!strcmp(linea, "SETIMP")) {
+    for (char* q = arg; *q; q++) *q = tolower((unsigned char)*q);
+    if      (!strcmp(arg, "cable"))     tipoImpresora = IMP_CABLE;
+    else if (!strcmp(arg, "bluetooth")) tipoImpresora = IMP_BLUETOOTH;
+    else { respError("SETIMP", "usa 'cable' o 'bluetooth'"); return; }
+    aplicarTipoImpresora();
+    prefs.putUChar("impresora", (uint8_t)tipoImpresora);
+    cmdCfg();
+  }
   else respError(linea, "orden desconocida");
 }
 
@@ -1528,7 +1533,7 @@ void setup() {
 
   // Tipo de impresora elegido la ultima vez (se conserva entre encendidos)
   prefs.begin("taco", false);
-  uint8_t guardado = prefs.getUChar("impresora", (uint8_t)IMP_BLUETOOTH);
+  uint8_t guardado = prefs.getUChar("impresora", (uint8_t)IMP_CABLE);
   tipoImpresora = (guardado == (uint8_t)IMP_CABLE) ? IMP_CABLE : IMP_BLUETOOTH;
   aplicarTipoImpresora();
   prefs.getString("agente", "").toCharArray(nombreAgente, sizeof(nombreAgente));
@@ -1616,11 +1621,12 @@ void loop() {
         iniciarArranque();
         estadoActual = ARRANQUE;
       }
-      if (digitalRead(pinImprimir) == LOW) {            // boton azul: menu
+      if (digitalRead(pinImprimir) == LOW) {            // boton azul: historico
         digitalWrite(pinLedVerde, 0);
         digitalWrite(pinLedAzul,0);
-        menuCursor = 0;
-        estadoActual = MENU;
+        cargarListaPruebas();
+        histDetalle = -1;
+        estadoActual = HISTORICO;
         esperarSoltar(pinImprimir);
       }
       break;
@@ -1664,6 +1670,8 @@ void loop() {
 
     case HISTORICO: {
       mostrarHistorico();
+      digitalWrite(pinLedRojo, (millis() / 500) % 2);   // parpadeo rojo y azul
+      digitalWrite(pinLedAzul, (millis() / 500) % 2);
       if (rojoPulsado()) { volverAEspera(); break; }
       int p = leerAzul();
       if (histDetalle >= 0) {                    // viendo el detalle
