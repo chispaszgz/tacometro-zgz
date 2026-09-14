@@ -358,7 +358,7 @@ char notaPrueba[MAX_NOTA + 1]     = "";
 // FW_VERSION la cambias tu en cada version publicada; PROTO_VERSION solo
 // cuando el formato de las respuestas JSON deje de ser compatible, para que
 // la webapp pueda avisar en vez de fallar de forma rara.
-#define FW_VERSION    "1.1.0"
+#define FW_VERSION    "1.2.0"
 #define PROTO_VERSION 1
 #define MAX_ID_DISP   20
 char idDispositivo[MAX_ID_DISP + 1] = "";
@@ -1088,7 +1088,7 @@ void mostrarDatos() {
 
 // ----------------------------------------------------------- HISTORICO
 #define MAX_LISTA   40
-#define LISTA_FILAS 5
+#define LISTA_FILAS 4
 char listaPruebas[MAX_LISTA][22];
 int  nPruebas = 0;
 
@@ -1151,10 +1151,115 @@ void mostrarDetallePrueba() {
     f.close();
   }
 
+  u8g2.drawFrame(0, 55, 128, 1);
   u8g2.setFont(u8g2_font_4x6_tf);
-  const char* pie = "AZUL=volver a la lista";
-  u8g2.drawStr((128 - u8g2.getStrWidth(pie)) / 2, 63, pie);
+  u8g2.drawStr(0, 63, "rojo=volver");
+  const char* pie = "azul=imprimir";
+  u8g2.drawStr(128 - u8g2.getStrWidth(pie), 63, pie);
   u8g2.sendBuffer();
+}
+
+// --- IMPRIMIR UNA PRUEBA GUARDADA ---
+// imprimir() trabaja sobre las variables globales de la ultima prueba. Para
+// reimprimir una guardada se vuelcan sus datos en esas mismas variables, se
+// imprime con el codigo de siempre y despues se restaura lo que habia. Asi el
+// ticket de una prueba antigua sale identico al que se imprimio en su dia.
+bool imprimiendoGuardada = false;
+
+struct CopiaPrueba {
+  float  pico, sost, hist[MAX_PUNTOS];
+  int    n;
+  char   agente[MAX_AGENTE + 1], nota[MAX_NOTA + 1];
+  double lat, lon;
+  bool   fix;
+  int    dia, mes, anio, hora, min, seg, dsem;
+};
+static CopiaPrueba copiaPrueba;   // estatica: ~330 B que no conviene en la pila
+// Sin el struct en la firma: el preprocesador de Arduino inyecta los prototipos
+// antes de que este definido y no compilaria.
+
+void guardarEstadoPrueba() {
+  CopiaPrueba& c = copiaPrueba;
+  c.pico = velMaxPico; c.sost = velMaxMantenida; c.n = nPuntos;
+  memcpy(c.hist, histVel, sizeof(histVel));
+  strncpy(c.agente, nombreAgente, sizeof(c.agente));
+  strncpy(c.nota, notaPrueba, sizeof(c.nota));
+  c.lat = gpsLat; c.lon = gpsLon; c.fix = gpsFix;
+  c.dia = localDia; c.mes = localMes; c.anio = localAnio;
+  c.hora = localHora; c.min = localMin; c.seg = localSeg; c.dsem = localDiaSemana;
+}
+
+void restaurarEstadoPrueba() {
+  const CopiaPrueba& c = copiaPrueba;
+  velMaxPico = c.pico; velMaxMantenida = c.sost; nPuntos = c.n;
+  memcpy(histVel, c.hist, sizeof(histVel));
+  strncpy(nombreAgente, c.agente, sizeof(nombreAgente));
+  strncpy(notaPrueba, c.nota, sizeof(notaPrueba));
+  gpsLat = c.lat; gpsLon = c.lon; gpsFix = c.fix;
+  localDia = c.dia; localMes = c.mes; localAnio = c.anio;
+  localHora = c.hora; localMin = c.min; localSeg = c.seg; localDiaSemana = c.dsem;
+}
+
+// Vuelca el CSV en las variables globales. Devuelve false si no se pudo leer.
+bool cargarPruebaGuardada(const char* nombre) {
+  char ruta[32];
+  snprintf(ruta, sizeof(ruta), "/%s", nombre);
+  File f = LittleFS.open(ruta, FILE_READ);
+  if (!f) return false;
+
+  nPuntos = 0; velMaxPico = 0; velMaxMantenida = 0;
+  gpsFix = false; nombreAgente[0] = '\0'; notaPrueba[0] = '\0';
+  localDia = localMes = localAnio = localHora = localMin = localSeg = 0;
+  localDiaSemana = -1;                     // sin fecha, sin nombre de dia
+  bool enCurva = false;
+
+  while (f.available()) {
+    String l = f.readStringUntil('\n');
+    l.trim();
+    int c = l.indexOf(',');
+    if (c < 0) continue;
+    String k = l.substring(0, c), v = l.substring(c + 1);
+    if (enCurva) {
+      if (nPuntos < MAX_PUNTOS) histVel[nPuntos++] = v.toFloat();
+      continue;
+    }
+    if      (k == "t_s")           enCurva = true;
+    else if (k == "agente")        v.toCharArray(nombreAgente, sizeof(nombreAgente));
+    else if (k == "nota")          v.toCharArray(notaPrueba, sizeof(notaPrueba));
+    else if (k == "vmax_pico_kmh") velMaxPico = v.toFloat();
+    else if (k == "vmax_5s_kmh")   velMaxMantenida = v.toFloat();
+    else if (k == "lat" && v.length()) { gpsLat = v.toDouble(); gpsFix = true; }
+    else if (k == "lon" && v.length()) gpsLon = v.toDouble();
+    else if (k == "fecha" && v.length() >= 10) {
+      localDia  = v.substring(0, 2).toInt();
+      localMes  = v.substring(3, 5).toInt();
+      localAnio = v.substring(6, 10).toInt();
+      localDiaSemana = diaSemana(localAnio, localMes, localDia);
+    }
+    else if (k == "hora" && v.length() >= 8) {
+      localHora = v.substring(0, 2).toInt();
+      localMin  = v.substring(3, 5).toInt();
+      localSeg  = v.substring(6, 8).toInt();
+    }
+  }
+  f.close();
+  return true;
+}
+
+void imprimirPruebaGuardada(const char* nombre) {
+  guardarEstadoPrueba();
+  if (cargarPruebaGuardada(nombre)) {
+    imprimiendoGuardada = true;
+    imprimir();
+    imprimiendoGuardada = false;
+  } else {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr((128 - u8g2.getStrWidth("No se puede leer")) / 2, 35, "No se puede leer");
+    u8g2.sendBuffer();
+    delay(1200);
+  }
+  restaurarEstadoPrueba();
 }
 
 void mostrarHistorico() {
@@ -1193,9 +1298,14 @@ void mostrarHistorico() {
     }
   }
 
+  // Botonera: rojo a la izquierda; el azul lleva un rotulo encima y sus dos
+  // pulsaciones debajo, a la derecha.
+  u8g2.drawFrame(0, 52, 128, 1);
   u8g2.setFont(u8g2_font_4x6_tf);
-  const char* pie = "rojo=salir corto=bajar largo=ver";
-  u8g2.drawStr((128 - u8g2.getStrWidth(pie)) / 2, 63, pie);
+  u8g2.drawStr(128 - u8g2.getStrWidth("azul"), 58, "azul");
+  u8g2.drawStr(0, 64, "rojo=salir");
+  const char* der = "corto=bajar largo=ver";
+  u8g2.drawStr(128 - u8g2.getStrWidth(der), 64, der);
   u8g2.sendBuffer();
 }
 
@@ -1672,12 +1782,16 @@ void loop() {
       mostrarHistorico();
       digitalWrite(pinLedRojo, (millis() / 500) % 2);   // parpadeo rojo y azul
       digitalWrite(pinLedAzul, (millis() / 500) % 2);
-      if (rojoPulsado()) { volverAEspera(); break; }
       int p = leerAzul();
-      if (histDetalle >= 0) {                    // viendo el detalle
-        if (p != PULSA_NADA) { histDetalle = -1; esperarSoltar(pinImprimir); }
+      if (histDetalle >= 0) {                    // viendo una prueba
+        if (rojoPulsado()) { histDetalle = -1; esperarSoltar(pinEmpezar); break; }
+        if (p != PULSA_NADA) {
+          imprimirPruebaGuardada(listaPruebas[histDetalle]);
+          esperarSoltar(pinImprimir);
+        }
         break;
       }
+      if (rojoPulsado()) { volverAEspera(); break; }
       if (p == PULSA_CORTA && nPruebas > 0) histCursor = (histCursor + 1) % nPruebas;
       else if (p == PULSA_LARGA && nPruebas > 0) {
         histDetalle = histCursor;
@@ -1793,7 +1907,8 @@ void imprimir() {
     }
   }
 
-  calcularHoraLocal();   // fecha/hora local actual para el ticket
+  // Con una prueba guardada la fecha/hora ya vienen del archivo
+  if (!imprimiendoGuardada) calcularHoraLocal();
 
   char buf[40];
   char num[10];
