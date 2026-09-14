@@ -120,6 +120,8 @@ const unsigned long INTERVALO_MIN_US =
 
 // --- PARAMETROS DE LA PRUEBA ---
 const float velocidadComienzo = 6.0;   // km/h: al superarse, se apaga el motor y arranca la prueba
+const float velocidadColocado = 2.0;   // km/h: por encima, hay un VMP sobre el rodillo libre
+const int   tiempoMaxColocar  = 60;    // segundos esperando a que coloquen el VMP
 const int   tiempoPrueba      = 30;    // segundos que dura la prueba
 const float margenVelMax      = 2.0;   // km/h: margen +- para la velocidad maxima mantenida 5 s
 const int   tiempoArranque    = 4;     // segundos de rampa de aceleracion del motor de arranque
@@ -143,11 +145,13 @@ Estado estadoActual = BIENVENIDA;
 
 // --- DATOS DE LA PRUEBA ---
 unsigned long tiempoInicioArranque = 0;
+bool          vmpColocado    = false;  // el rodillo libre gira: hay un VMP encima
+unsigned long tiempoColocado = 0;      // instante en que se detecto
 unsigned long tiempoInicioPrueba = 0;
 float velMaxPico = 0;       // pico absoluto alcanzado
 float velMaxMantenida = 0;  // mayor velocidad sostenida 5 s (dentro del margen)
 
-#define N_MUESTRAS 10        // 5 s con una mediana cada 500 ms
+#define N_MUESTRAS 20        // 5 s con una mediana cada 250 ms
 float muestras[N_MUESTRAS];
 int   idxMuestra  = 0;
 int   numMuestras = 0;
@@ -157,14 +161,17 @@ int   numMuestras = 0;
 // de esas sub-muestras como valor oficial. La mediana ignora un pico aislado
 // (aunque caiga dentro del rango plausible), de modo que la subida es
 // progresiva y velMaxPico no registra esos picos.
-#define VENTANA_MS       500 // periodo de consolidacion
-#define SUB_INTERVALO_MS 50  // cada cuanto se sub-muestrea dentro de la ventana
+#define VENTANA_MS       250 // periodo de consolidacion: 4 muestras/s
+#define SUB_INTERVALO_MS 25  // cada cuanto se sub-muestrea dentro de la ventana
 #define SUB_N            12   // capacidad del buffer (VENTANA_MS/SUB_INTERVALO_MS + margen)
 
 // --- HISTORICO COMPLETO PARA LA GRAFICA DEL TICKET ---
-#define MAX_PUNTOS 60        // tiempoPrueba (30 s) / 500 ms
+#define MAX_PUNTOS 120       // tiempoPrueba (30 s) / 250 ms
 float histVel[MAX_PUNTOS];
 int   nPuntos = 0;
+// Segundos entre puntos. Normalmente VENTANA_MS; al cargar una prueba antigua
+// se toma del propio archivo, para que la grafica salga a escala.
+float histDt = VENTANA_MS / 1000.0f;
 
 // Bitmap monocromo de la grafica (1 bit = 1 px). Ancho multiplo de 8.
 #define G_W 384              // ancho en px (todo el papel de 58 mm)
@@ -358,7 +365,7 @@ char notaPrueba[MAX_NOTA + 1]     = "";
 // FW_VERSION la cambias tu en cada version publicada; PROTO_VERSION solo
 // cuando el formato de las respuestas JSON deje de ser compatible, para que
 // la webapp pueda avisar en vez de fallar de forma rara.
-#define FW_VERSION    "1.2.0"
+#define FW_VERSION    "1.3.0"
 #define PROTO_VERSION 1
 #define MAX_ID_DISP   20
 char idDispositivo[MAX_ID_DISP + 1] = "";
@@ -761,7 +768,14 @@ void pruebaImpresion();
 void IRAM_ATTR detectarPulso() {
   unsigned long tiempoActual = micros();
   unsigned long delta = tiempoActual - tiempoUltimoPulso;
-  if (delta < INTERVALO_MIN_US) return;   // pulso espurio (rebote/ruido): se ignora
+  if (delta < INTERVALO_MIN_US) return;   // tope absoluto: mas de 90 km/h es ruido
+  // Filtro fisico: entre dos vueltas el VMP no puede acelerar tanto como para
+  // acortar el intervalo por debajo del 75 % del anterior. Un pulso falso que
+  // cae en mitad de una vuelta produce justo eso, y se descarta sin mover la
+  // marca de tiempo, de modo que la vuelta real siguiente se mide bien.
+  // Solo actua con el rodillo ya girando deprisa (intervalo < 100 ms, unos
+  // 7 km/h): a velocidades bajas la aceleracion legitima si puede ser brusca.
+  if (intervalo > 0 && intervalo < 100000UL && delta < (intervalo * 3UL) / 4UL) return;
   intervalo = delta;
   tiempoUltimoPulso = tiempoActual;
 }
@@ -874,8 +888,10 @@ void mostrarEspera() {
     dtostrf(gpsLon, 0, 5, lon);
     snprintf(buf, sizeof(buf), "GPS: %s , %s", lat, lon);
   } else {
-    snprintf(buf, sizeof(buf), "GPS: buscando (%d sat)",
-             (int)gps.satellites.value());
+    // El numero de satelites no aporta nada en pantalla: se sustituye por
+    // unos puntos que avanzan, para que se vea que el aparato sigue vivo.
+    int puntos = 1 + (millis() / 400) % 3;
+    snprintf(buf, sizeof(buf), "GPS: buscando%.*s", puntos, "...");
   }
   u8g2.drawStr(0, 9, buf);
 
@@ -1167,7 +1183,7 @@ void mostrarDetallePrueba() {
 bool imprimiendoGuardada = false;
 
 struct CopiaPrueba {
-  float  pico, sost, hist[MAX_PUNTOS];
+  float  pico, sost, hist[MAX_PUNTOS], dt;
   int    n;
   char   agente[MAX_AGENTE + 1], nota[MAX_NOTA + 1];
   double lat, lon;
@@ -1180,7 +1196,7 @@ static CopiaPrueba copiaPrueba;   // estatica: ~330 B que no conviene en la pila
 
 void guardarEstadoPrueba() {
   CopiaPrueba& c = copiaPrueba;
-  c.pico = velMaxPico; c.sost = velMaxMantenida; c.n = nPuntos;
+  c.pico = velMaxPico; c.sost = velMaxMantenida; c.n = nPuntos; c.dt = histDt;
   memcpy(c.hist, histVel, sizeof(histVel));
   strncpy(c.agente, nombreAgente, sizeof(c.agente));
   strncpy(c.nota, notaPrueba, sizeof(c.nota));
@@ -1191,7 +1207,7 @@ void guardarEstadoPrueba() {
 
 void restaurarEstadoPrueba() {
   const CopiaPrueba& c = copiaPrueba;
-  velMaxPico = c.pico; velMaxMantenida = c.sost; nPuntos = c.n;
+  velMaxPico = c.pico; velMaxMantenida = c.sost; nPuntos = c.n; histDt = c.dt;
   memcpy(histVel, c.hist, sizeof(histVel));
   strncpy(nombreAgente, c.agente, sizeof(nombreAgente));
   strncpy(notaPrueba, c.nota, sizeof(notaPrueba));
@@ -1211,7 +1227,9 @@ bool cargarPruebaGuardada(const char* nombre) {
   gpsFix = false; nombreAgente[0] = '\0'; notaPrueba[0] = '\0';
   localDia = localMes = localAnio = localHora = localMin = localSeg = 0;
   localDiaSemana = -1;                     // sin fecha, sin nombre de dia
+  histDt = VENTANA_MS / 1000.0f;
   bool enCurva = false;
+  float t0Curva = 0;
 
   while (f.available()) {
     String l = f.readStringUntil('\n');
@@ -1220,7 +1238,12 @@ bool cargarPruebaGuardada(const char* nombre) {
     if (c < 0) continue;
     String k = l.substring(0, c), v = l.substring(c + 1);
     if (enCurva) {
-      if (nPuntos < MAX_PUNTOS) histVel[nPuntos++] = v.toFloat();
+      if (nPuntos < MAX_PUNTOS) {
+        float t = k.toFloat();
+        if (nPuntos == 0) t0Curva = t;
+        if (nPuntos == 1 && t > t0Curva) histDt = t - t0Curva;   // paso real del archivo
+        histVel[nPuntos++] = v.toFloat();
+      }
       continue;
     }
     if      (k == "t_s")           enCurva = true;
@@ -1601,8 +1624,8 @@ void crearPruebaDemo(const char* nombre, const char* agente, const char* nota,
   for (int i = 0; i < MAX_PUNTOS; i++) {
     float t = (float)i / (float)(MAX_PUNTOS - 1);
     dtostrf(pico * (1.0 - exp(-4.0 * t)), 0, 1, num);
-    int decimas = i * VENTANA_MS / 100;
-    f.printf("%d.%d,%s\n", decimas / 10, decimas % 10, num);
+    int centesimas = i * VENTANA_MS / 10;   // 250 ms -> 25 centesimas por punto
+    f.printf("%d.%02d,%s\n", centesimas / 100, centesimas % 100, num);
   }
   f.close();
   Serial.printf("[FS] creada %s\n", ruta);
@@ -1875,11 +1898,12 @@ void ejecutarResultado() {
   snprintf(buf, sizeof(buf), "V.max 5s: %s km/h", num);
   u8g2.drawStr(0, 42, buf);
 
-  // Mensajes inferiores centrados (azul: imprimir / rojo: salir)
-  const char* msgImprimir = "Imprimir boton azul";
-  u8g2.drawStr((128 - u8g2.getStrWidth(msgImprimir)) / 2, 53, msgImprimir);
-  const char* msgSalir = "Salir boton rojo";
-  u8g2.drawStr((128 - u8g2.getStrWidth(msgSalir)) / 2, 62, msgSalir);
+  // Botonera, con el mismo patron que las demas pantallas
+  u8g2.drawFrame(0, 55, 128, 1);
+  u8g2.setFont(u8g2_font_4x6_tf);
+  u8g2.drawStr(0, 63, "rojo=salir");
+  const char* der = "azul=imprimir";
+  u8g2.drawStr(128 - u8g2.getStrWidth(der), 63, der);
 
   u8g2.sendBuffer();
 }
@@ -2028,7 +2052,8 @@ void imprimir() {
 //     DUR    duracion en segundos
 //     PICO   velocidad maxima de pico, en DECIMAS de km/h (274 = 27,4)
 //     SOST   velocidad maxima sostenida 5 s, tambien en decimas
-//     CURVA  un par de caracteres por punto, cada uno el valor en decimas
+//     CURVA  un par de caracteres por punto, cada uno el valor en decimas;
+//            como mucho 60 puntos, repartidos uniformemente en DUR segundos
 //            codificado en BASE 36 (0-9 A-Z). "7M" = 7*36+22 = 274 = 27,4 km/h
 //
 // Solo se usan caracteres del juego alfanumerico del QR (0-9 A-Z y  $%*+-./: ),
@@ -2064,8 +2089,11 @@ void construirCargaQR(char* dest, size_t tam) {
                 (int)(velMaxPico * 10.0 + 0.5),
                 (int)(velMaxMantenida * 10.0 + 0.5));
 
-  // Curva: dos caracteres por punto
-  for (int i = 0; i < nPuntos && (size_t)(n + 3) < tam; i++) {
+  // Curva: dos caracteres por punto. Se limita a 60 puntos repartidos por
+  // toda la duracion para que el QR no crezca al subir el muestreo a 4 Hz.
+  int paso = (nPuntos + 59) / 60;
+  if (paso < 1) paso = 1;
+  for (int i = 0; i < nPuntos && (size_t)(n + 3) < tam; i += paso) {
     base36dos(dest + n, (int)(histVel[i] * 10.0 + 0.5));
     n += 2;
   }
@@ -2205,7 +2233,9 @@ void construirGrafica() {
   // la traza acaba en el instante real)
   int pxA = 0, pyA = 0;
   for (int i = 0; i < nPuntos; i++) {
-    int px = x0 + (int)((long)i * w / (MAX_PUNTOS - 1));
+    float tx = i * histDt / (float)tiempoPrueba;      // 0..1 dentro de la prueba
+    if (tx > 1.0f) tx = 1.0f;
+    int px = x0 + (int)(tx * w);
     float v = histVel[i];
     if (v < 0) v = 0;
     if (v > vMax) v = vMax;
@@ -2282,9 +2312,9 @@ bool guardarPrueba() {
   // no es de fiar en todas las configuraciones del core.
   f.println("t_s,vel_kmh");
   for (int i = 0; i < nPuntos; i++) {
-    int decimas = i * VENTANA_MS / 100;
+    int centesimas = i * VENTANA_MS / 10;   // 250 ms -> 25 centesimas por punto
     dtostrf(histVel[i], 0, 1, num);
-    f.printf("%d.%d,%s\n", decimas / 10, decimas % 10, num);
+    f.printf("%d.%02d,%s\n", centesimas / 100, centesimas % 100, num);
   }
   f.close();
 
@@ -2296,6 +2326,7 @@ bool guardarPrueba() {
 // Entra en la fase de arranque: empieza la rampa del motor desde el 80 %.
 void iniciarArranque() {
   tiempoInicioArranque = millis();
+  vmpColocado = false;
   ledcWrite(pinMotor, pwmMinMotor);   // la rampa arranca en el 80 %
 }
 
@@ -2306,6 +2337,7 @@ void iniciarMedida() {
   idxMuestra      = 0;
   numMuestras     = 0;
   nPuntos         = 0;
+  histDt          = VENTANA_MS / 1000.0f;
   tiempoInicioPrueba = millis();
 }
 
@@ -2364,8 +2396,15 @@ void leerVelocidad(float &rpm, float &kmh) {
   }
 }
 
-// ESTADO ARRANQUE: rampa de PWM del motor. Transita a MEDICION si se alcanza
-// velocidadComienzo, o a ESPERA si pasan tiempoMaxArranque segundos sin lograrlo.
+// ESTADO ARRANQUE. El sensor va en el rodillo LIBRE, el que no mueve el motor:
+// solo gira cuando hay una rueda encima, asi que su velocidad delata si el VMP
+// esta colocado. Tres fases:
+//   1. "COLOCA EL VMP": el rodillo libre no gira (kmh < velocidadColocado).
+//      Se espera hasta tiempoMaxColocar; si no, vuelta a ESPERA.
+//   2. "ACELERA EL VMP": ya gira, pero no llega a velocidadComienzo. Si baja
+//      del umbral (lo han levantado) se vuelve a la fase 1. Tope:
+//      tiempoMaxArranque contado desde que se detecto el VMP.
+//   3. Al alcanzar velocidadComienzo se apaga el motor y arranca MEDICION.
 void ejecutarArranque() {
   static unsigned long ultimaActualizacion = 0;
   if (millis() - ultimaActualizacion < 250) return;   // refresco cada 250 ms
@@ -2374,7 +2413,7 @@ void ejecutarArranque() {
   float rpm, kmh;
   leerVelocidad(rpm, kmh);
 
-  // Rampa lineal de pwmMinMotor a pwmMaxMotor en tiempoArranque segundos.
+  // Rampa lineal del motor de arranque, de pwmMinMotor a pwmMaxMotor
   unsigned long tArr = millis() - tiempoInicioArranque;
   unsigned long rampaMs = (unsigned long)tiempoArranque * 1000UL;
   int duty = (tArr >= rampaMs)
@@ -2382,36 +2421,59 @@ void ejecutarArranque() {
                : pwmMinMotor + (int)(tArr * (pwmMaxMotor - pwmMinMotor) / rampaMs);
   ledcWrite(pinMotor, duty);
 
-  // Transicion: velocidad de salida alcanzada -> empezar la medida
+  // Fase 3: velocidad de salida alcanzada -> empezar la medida
   if (kmh >= velocidadComienzo) {
     ledcWrite(pinMotor, 0);
     iniciarMedida();
     estadoActual = MEDICION;
     return;
   }
-  // Transicion: no se alcanza en tiempoMaxArranque -> volver a ESPERA
-  if (tArr >= (unsigned long)tiempoMaxArranque * 1000UL) {
-    ledcWrite(pinMotor, 0);
-    estadoActual = ESPERA;
-    return;
+
+  // Deteccion del VMP sobre el rodillo libre, con histeresis para que un
+  // bache de lectura no haga saltar la pantalla de una fase a otra
+  if (!vmpColocado) {
+    if (kmh >= velocidadColocado) { vmpColocado = true; tiempoColocado = millis(); }
+  } else if (kmh < velocidadColocado * 0.5f) {
+    vmpColocado = false;                                // lo han levantado
   }
 
+  // Tiempo maximo de la fase en curso
+  int restante;
+  if (!vmpColocado) {
+    if (tArr >= (unsigned long)tiempoMaxColocar * 1000UL) {
+      ledcWrite(pinMotor, 0); estadoActual = ESPERA; return;
+    }
+    restante = tiempoMaxColocar - (int)(tArr / 1000);
+  } else {
+    unsigned long tCol = millis() - tiempoColocado;
+    if (tCol >= (unsigned long)tiempoMaxArranque * 1000UL) {
+      ledcWrite(pinMotor, 0); estadoActual = ESPERA; return;
+    }
+    restante = tiempoMaxArranque - (int)(tCol / 1000);
+  }
+
+  // Pantalla
+  char buf[14];
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr((128 - u8g2.getStrWidth("ARRANCANDO...")) / 2, 10, "ARRANCANDO...");
+  const char* titulo = vmpColocado ? "ACELERA EL VMP" : "COLOCA EL VMP";
+  u8g2.drawStr((128 - u8g2.getStrWidth(titulo)) / 2, 10, titulo);
   u8g2.drawFrame(0, 12, 128, 1);
-  u8g2.setFont(u8g2_font_logisoso24_tn);
-  u8g2.setCursor(5, 40);
-  u8g2.print(kmh, 1);
-  u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(80, 37, "km/h");
 
-  char buf[14];
-  snprintf(buf, sizeof(buf), "RPM:%d", (int)rpm);
-  u8g2.drawStr(5, 56, buf);
-  int restArr = tiempoMaxArranque - (int)(tArr / 1000);   // cuenta atras del timeout
-  snprintf(buf, sizeof(buf), "%02ds", restArr);
-  u8g2.drawStr(108, 56, buf);
+  if (!vmpColocado) {
+    u8g2.drawStr((128 - u8g2.getStrWidth("en los rodillos")) / 2, 36, "en los rodillos");
+  } else {
+    u8g2.setFont(u8g2_font_logisoso24_tn);
+    u8g2.setCursor(5, 40);
+    u8g2.print(kmh, 1);
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(80, 37, "km/h");
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.drawStr(0, 56, "para comenzar");
+  }
+  u8g2.setFont(u8g2_font_5x7_tf);
+  snprintf(buf, sizeof(buf), "%02ds", restante);      // cuenta atras de la fase
+  u8g2.drawStr(113, 56, buf);
   u8g2.sendBuffer();
 }
 
