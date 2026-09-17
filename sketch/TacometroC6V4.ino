@@ -365,7 +365,7 @@ char notaPrueba[MAX_NOTA + 1]     = "";
 // FW_VERSION la cambias tu en cada version publicada; PROTO_VERSION solo
 // cuando el formato de las respuestas JSON deje de ser compatible, para que
 // la webapp pueda avisar en vez de fallar de forma rara.
-#define FW_VERSION    "1.4.0"
+#define FW_VERSION    "1.4.2"
 #define PROTO_VERSION 1
 #define MAX_ID_DISP   20
 char idDispositivo[MAX_ID_DISP + 1] = "";
@@ -764,30 +764,41 @@ void TecladoBLE::desconectar() {
 // Verificado el 17/09/2026. Se anuncia como teclado HID (appearance 0x03C1)
 // pero en su modo actual los botones no envian teclas:
 //   - Boton 1: un toque en un punto fijo del informe de digitalizador (ID 4):
-//       03 F5 C1 12 al pulsar (dedo apoyado en X=501, Y=300), 02 ... al soltar.
-//   - Boton 2: informe multimedia (ID 2): 01 00 o 02 00 al pulsar (alterna
-//       volumen +/- en cada pulsacion, da igual cual), 00 00 al soltar.
-//   - La cruceta emula deslizamientos de dedo por el mismo informe ID 4; se
-//       distinguen del boton 1 porque la posicion se mueve.
+//       03 F5 C1 12 y, acto seguido, 02 F5 C1 12 (dedo en X=501, Y=300).
+//   - Boton 2: informe multimedia (ID 2): 01 00 o 02 00 (alterna volumen +/-,
+//       da igual cual) y acto seguido 00 00.
+//   - Cruceta: deslizamientos de dedo por el mismo informe ID 4. De momento
+//       NO se usa: se ignora todo gesto que no sea el toque del boton 1.
+//
+// IMPORTANTE: el mando NO transmite cuanto dura la pulsacion. Por larga que
+// sea fisicamente, envia "pulsado" y "soltado" seguidos. Por eso:
+//   Boton 1                 -> ROJO   (pulsacion virtual de 150 ms)
+//   Boton 2, un clic        -> AZUL corto (150 ms), emitido al cerrar la
+//                              ventana de doble clic, o sea con ~350 ms de retardo
+//   Boton 2, dos clics      -> AZUL largo (750 ms, por encima del umbral de
+//      en menos de 350 ms      leerAzul(), que asi la clasifica como larga)
+// Las pantallas consultan rojoActivo()/azulActivo(), que miran el pin fisico
+// y el mando a la vez, asi que la logica de corto/largo no cambia.
+//
 // Cada report ID va en su propia caracteristica 0x2A4D: hay que recorrerlas
 // POR HANDLE, porque el mapa por UUID de la libreria colapsa las repetidas.
-//
-// Los dos botones equivalen a los fisicos del tacometro: las pantallas
-// consultan rojoActivo()/azulActivo(), que miran el pin y el mando a la vez.
 const char* NOMBRE_MANDO = "MUZHTEN";
 const char* MAC_MANDO    = "58:2b:37:58:86:78";
-#define MANDO_TAP_X        501    // punto del toque del boton 1
-#define MANDO_TAP_Y        300
-#define MANDO_TAP_TOL      6      // tolerancia, en unidades del digitalizador
-#define MANDO_TAP_MIN_MS   100    // un toque mas corto es el arranque de un deslizamiento
-#define MANDO_REINTENTO_MS 15000  // entre intentos de reconexion
-#define MANDO_TIMEOUT_MS   1500   // espera maxima por intento (bloquea el bucle)
+#define MANDO_TAP_X          501    // punto del toque del boton 1
+#define MANDO_TAP_Y          300
+#define MANDO_TAP_TOL        6      // tolerancia, en unidades del digitalizador
+#define MANDO_TAP_MAX_MOV    40     // mas desplazamiento que esto es cruceta: se ignora
+#define MANDO_DOBLE_MS       350    // ventana para el doble clic del boton 2
+#define MANDO_PULSO_CORTO_MS 150    // duracion virtual de una pulsacion corta
+#define MANDO_PULSO_LARGO_MS 750    // > PULSACION_LARGA_MS: leerAzul() la ve larga
+#define MANDO_REINTENTO_MS   15000  // entre intentos de reconexion
+#define MANDO_TIMEOUT_MS     1500   // espera maxima por intento (bloquea el bucle)
 
 class MandoBLE {
 public:
   bool conectado() { return _cli != nullptr && _cli->isConnected(); }
-  bool rojo();
-  bool azul() { return _consumidorPulsado; }
+  bool rojo() { return (long)(_rojoHasta - millis()) > 0; }
+  bool azul();
   bool conectar(uint32_t timeoutMs);
   void mantener(bool permitido);          // reconexion periodica, llamar en el loop
   static void alRecibir(BLERemoteCharacteristic* chr, uint8_t* d, size_t len, bool);
@@ -795,15 +806,21 @@ private:
   BLEClient* _cli = nullptr;
   unsigned long _ultimoIntento = 0;
   static uint16_t _hConsumidor, _hTactil;
-  static volatile bool _consumidorPulsado, _tapEnCurso;
-  static volatile unsigned long _tapDesde;
+  static volatile unsigned long _rojoHasta, _azulHasta;
+  static volatile uint8_t _clicsAzul;         // clics del boton 2 pendientes de resolver
+  static volatile unsigned long _ultimoClicAzul;
+  static bool _dedo;                          // gesto tactil en curso
+  static int  _x0, _y0, _x, _y;               // inicio y ultima posicion del gesto
 };
 
 uint16_t MandoBLE::_hConsumidor = 0;
 uint16_t MandoBLE::_hTactil = 0;
-volatile bool MandoBLE::_consumidorPulsado = false;
-volatile bool MandoBLE::_tapEnCurso = false;
-volatile unsigned long MandoBLE::_tapDesde = 0;
+volatile unsigned long MandoBLE::_rojoHasta = 0;
+volatile unsigned long MandoBLE::_azulHasta = 0;
+volatile uint8_t MandoBLE::_clicsAzul = 0;
+volatile unsigned long MandoBLE::_ultimoClicAzul = 0;
+bool MandoBLE::_dedo = false;
+int  MandoBLE::_x0 = 0, MandoBLE::_y0 = 0, MandoBLE::_x = 0, MandoBLE::_y = 0;
 
 MandoBLE mando;
 
@@ -811,37 +828,54 @@ MandoBLE mando;
 bool rojoActivo() { return digitalRead(pinEmpezar)  == LOW || mando.rojo(); }
 bool azulActivo() { return digitalRead(pinImprimir) == LOW || mando.azul(); }
 
-// El toque tiene que llevar un minimo apoyado en el punto fijo: el primer
-// informe de un deslizamiento de la cruceta cae en ese mismo punto y se
-// mueve en el siguiente, con lo que nunca llega a cumplir el minimo.
-bool MandoBLE::rojo() {
-  return _tapEnCurso && (millis() - _tapDesde) >= MANDO_TAP_MIN_MS;
+// Se llama desde el loop: resuelve los clics pendientes del boton 2. Dos clics
+// dentro de la ventana son una pulsacion larga; uno solo, al cerrarse la
+// ventana sin segundo clic, una corta. La comparacion con signo sobrevive al
+// desborde de millis().
+bool MandoBLE::azul() {
+  if (_clicsAzul >= 2) {
+    _clicsAzul = 0;
+    _azulHasta = millis() + MANDO_PULSO_LARGO_MS;
+  } else if (_clicsAzul == 1 && millis() - _ultimoClicAzul > MANDO_DOBLE_MS) {
+    _clicsAzul = 0;
+    _azulHasta = millis() + MANDO_PULSO_CORTO_MS;
+  }
+  return (long)(_azulHasta - millis()) > 0;
 }
 
 void MandoBLE::alRecibir(BLERemoteCharacteristic* chr, uint8_t* d, size_t len, bool) {
   uint16_t h = chr->getHandle();
-  if (h == _hConsumidor && len >= 2) {              // boton 2
-    _consumidorPulsado = (d[0] != 0 || d[1] != 0);
+
+  if (h == _hConsumidor && len >= 2) {              // boton 2: solo cuenta el pulsado
+    if (d[0] != 0 || d[1] != 0) {
+      _ultimoClicAzul = millis();
+      if (_clicsAzul < 2) _clicsAzul++;
+    }
     return;
   }
-  if (h == _hTactil && len >= 4) {                  // boton 1 o cruceta
+
+  if (h == _hTactil && len >= 4) {                  // boton 1 (la cruceta se ignora)
     bool dedo = d[0] & 0x01;
-    int x = d[1] | ((d[2] & 0x0F) << 8);
-    int y = (d[2] >> 4) | (d[3] << 4);
-    bool enPunto = abs(x - MANDO_TAP_X) <= MANDO_TAP_TOL &&
-                   abs(y - MANDO_TAP_Y) <= MANDO_TAP_TOL;
-    if (dedo && enPunto) {
-      if (!_tapEnCurso) { _tapDesde = millis(); _tapEnCurso = true; }
-    } else {
-      _tapEnCurso = false;                          // soltado, o se movio (cruceta)
+    _x = d[1] | ((d[2] & 0x0F) << 8);
+    _y = (d[2] >> 4) | (d[3] << 4);
+    if (dedo && !_dedo) { _x0 = _x; _y0 = _y; }     // empieza un gesto
+    if (!dedo && _dedo) {                           // termina: ¿es el toque del boton 1?
+      bool quieto  = abs(_x - _x0) < MANDO_TAP_MAX_MOV && abs(_y - _y0) < MANDO_TAP_MAX_MOV;
+      bool enPunto = abs(_x0 - MANDO_TAP_X) <= MANDO_TAP_TOL &&
+                     abs(_y0 - MANDO_TAP_Y) <= MANDO_TAP_TOL;
+      // Solo cuenta un toque quieto en el punto del boton 1: tras cada pulsacion
+      // del boton 2 el mando suelta un toque basura en (0,0), y la cruceta se mueve.
+      if (quieto && enPunto) _rojoHasta = millis() + MANDO_PULSO_CORTO_MS;
     }
+    _dedo = dedo;
   }
 }
 
 bool MandoBLE::conectar(uint32_t timeoutMs) {
   if (conectado()) return true;
-  _consumidorPulsado = false;
-  _tapEnCurso = false;
+  _dedo = false;
+  _clicsAzul = 0;
+  _rojoHasta = _azulHasta = 0;
   _hConsumidor = _hTactil = 0;
   if (_cli == nullptr) _cli = BLEDevice::createClient();
 
@@ -1452,9 +1486,8 @@ void mostrarHistorico() {
   u8g2.setFont(u8g2_font_4x6_tf);
   // Tres columnas de 4x6: ROJO 0-40 px, CORTO 44-88, LARGO 92-128, con el
   // rotulo AZUL centrado sobre cada una de sus dos pulsaciones.
-  int wAzul = u8g2.getStrWidth("AZUL");
-  u8g2.drawStr(44 + (44 - wAzul) / 2, 58, "AZUL");
-  u8g2.drawStr(92 + (36 - wAzul) / 2, 58, "AZUL");
+  u8g2.drawStr(44, 58, "AZUL");                     // sobre CORTO
+  u8g2.drawStr(92, 58, "AZUL");                     // sobre LARGO
   u8g2.drawStr(0,  64, "ROJO=SALIR");
   u8g2.drawStr(44, 64, "CORTO=BAJAR");
   u8g2.drawStr(92, 64, "LARGO=VER");
