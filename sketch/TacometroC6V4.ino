@@ -365,7 +365,7 @@ char notaPrueba[MAX_NOTA + 1]     = "";
 // FW_VERSION la cambias tu en cada version publicada; PROTO_VERSION solo
 // cuando el formato de las respuestas JSON deje de ser compatible, para que
 // la webapp pueda avisar en vez de fallar de forma rara.
-#define FW_VERSION    "1.3.0"
+#define FW_VERSION    "1.4.0"
 #define PROTO_VERSION 1
 #define MAX_ID_DISP   20
 char idDispositivo[MAX_ID_DISP + 1] = "";
@@ -758,6 +758,129 @@ void TecladoBLE::desconectar() {
 
 // =====================================================================
 
+// =====================================================================
+//  MANDO BLE MUZHTEN (dos botones de accion + cruceta)
+// =====================================================================
+// Verificado el 17/09/2026. Se anuncia como teclado HID (appearance 0x03C1)
+// pero en su modo actual los botones no envian teclas:
+//   - Boton 1: un toque en un punto fijo del informe de digitalizador (ID 4):
+//       03 F5 C1 12 al pulsar (dedo apoyado en X=501, Y=300), 02 ... al soltar.
+//   - Boton 2: informe multimedia (ID 2): 01 00 o 02 00 al pulsar (alterna
+//       volumen +/- en cada pulsacion, da igual cual), 00 00 al soltar.
+//   - La cruceta emula deslizamientos de dedo por el mismo informe ID 4; se
+//       distinguen del boton 1 porque la posicion se mueve.
+// Cada report ID va en su propia caracteristica 0x2A4D: hay que recorrerlas
+// POR HANDLE, porque el mapa por UUID de la libreria colapsa las repetidas.
+//
+// Los dos botones equivalen a los fisicos del tacometro: las pantallas
+// consultan rojoActivo()/azulActivo(), que miran el pin y el mando a la vez.
+const char* NOMBRE_MANDO = "MUZHTEN";
+const char* MAC_MANDO    = "58:2b:37:58:86:78";
+#define MANDO_TAP_X        501    // punto del toque del boton 1
+#define MANDO_TAP_Y        300
+#define MANDO_TAP_TOL      6      // tolerancia, en unidades del digitalizador
+#define MANDO_TAP_MIN_MS   100    // un toque mas corto es el arranque de un deslizamiento
+#define MANDO_REINTENTO_MS 15000  // entre intentos de reconexion
+#define MANDO_TIMEOUT_MS   1500   // espera maxima por intento (bloquea el bucle)
+
+class MandoBLE {
+public:
+  bool conectado() { return _cli != nullptr && _cli->isConnected(); }
+  bool rojo();
+  bool azul() { return _consumidorPulsado; }
+  bool conectar(uint32_t timeoutMs);
+  void mantener(bool permitido);          // reconexion periodica, llamar en el loop
+  static void alRecibir(BLERemoteCharacteristic* chr, uint8_t* d, size_t len, bool);
+private:
+  BLEClient* _cli = nullptr;
+  unsigned long _ultimoIntento = 0;
+  static uint16_t _hConsumidor, _hTactil;
+  static volatile bool _consumidorPulsado, _tapEnCurso;
+  static volatile unsigned long _tapDesde;
+};
+
+uint16_t MandoBLE::_hConsumidor = 0;
+uint16_t MandoBLE::_hTactil = 0;
+volatile bool MandoBLE::_consumidorPulsado = false;
+volatile bool MandoBLE::_tapEnCurso = false;
+volatile unsigned long MandoBLE::_tapDesde = 0;
+
+MandoBLE mando;
+
+// Los botones fisicos y los del mando se consultan siempre por aqui
+bool rojoActivo() { return digitalRead(pinEmpezar)  == LOW || mando.rojo(); }
+bool azulActivo() { return digitalRead(pinImprimir) == LOW || mando.azul(); }
+
+// El toque tiene que llevar un minimo apoyado en el punto fijo: el primer
+// informe de un deslizamiento de la cruceta cae en ese mismo punto y se
+// mueve en el siguiente, con lo que nunca llega a cumplir el minimo.
+bool MandoBLE::rojo() {
+  return _tapEnCurso && (millis() - _tapDesde) >= MANDO_TAP_MIN_MS;
+}
+
+void MandoBLE::alRecibir(BLERemoteCharacteristic* chr, uint8_t* d, size_t len, bool) {
+  uint16_t h = chr->getHandle();
+  if (h == _hConsumidor && len >= 2) {              // boton 2
+    _consumidorPulsado = (d[0] != 0 || d[1] != 0);
+    return;
+  }
+  if (h == _hTactil && len >= 4) {                  // boton 1 o cruceta
+    bool dedo = d[0] & 0x01;
+    int x = d[1] | ((d[2] & 0x0F) << 8);
+    int y = (d[2] >> 4) | (d[3] << 4);
+    bool enPunto = abs(x - MANDO_TAP_X) <= MANDO_TAP_TOL &&
+                   abs(y - MANDO_TAP_Y) <= MANDO_TAP_TOL;
+    if (dedo && enPunto) {
+      if (!_tapEnCurso) { _tapDesde = millis(); _tapEnCurso = true; }
+    } else {
+      _tapEnCurso = false;                          // soltado, o se movio (cruceta)
+    }
+  }
+}
+
+bool MandoBLE::conectar(uint32_t timeoutMs) {
+  if (conectado()) return true;
+  _consumidorPulsado = false;
+  _tapEnCurso = false;
+  _hConsumidor = _hTactil = 0;
+  if (_cli == nullptr) _cli = BLEDevice::createClient();
+
+  // Conexion directa a su direccion, sin rastrear: si el mando esta dormido,
+  // connect() agota el tiempo y se vuelve a intentar mas tarde.
+  if (!_cli->connect(BLEAddress(String(MAC_MANDO)), 0, timeoutMs)) return false;
+  if (!_cli->secureConnection()) { _cli->disconnect(); return false; }
+
+  BLERemoteService* svc = _cli->getService(BLEUUID(String(UUID_HID_SVC)));
+  if (svc == nullptr) { _cli->disconnect(); return false; }
+  std::map<uint16_t, BLERemoteCharacteristic*>* cars = svc->getCharacteristicsByHandle();
+  if (cars == nullptr) { _cli->disconnect(); return false; }
+
+  int n = 0;
+  for (auto& c : *cars) {
+    BLERemoteCharacteristic* chr = c.second;
+    if (!chr->getUUID().equals(BLEUUID(String(UUID_HID_REPORT))) || !chr->canNotify()) continue;
+    // El descriptor Report Reference (0x2908) dice el ID de cada informe
+    uint8_t id = 0;
+    BLERemoteDescriptor* ref = chr->getDescriptor(BLEUUID((uint16_t)0x2908));
+    if (ref) { String v = ref->readValue(); if (v.length() >= 1) id = (uint8_t)v[0]; }
+    if (id == 2) _hConsumidor = chr->getHandle();
+    if (id == 4) _hTactil     = chr->getHandle();
+    chr->registerForNotify(MandoBLE::alRecibir);
+    n++;
+  }
+  if (n == 0 || _hConsumidor == 0 || _hTactil == 0) { _cli->disconnect(); return false; }
+  Serial.printf("[MANDO] conectado: %d informes, boton1 h%u, boton2 h%u", n, _hTactil, _hConsumidor);
+  Serial.println();
+  return true;
+}
+
+void MandoBLE::mantener(bool permitido) {
+  if (conectado() || !permitido) return;
+  if (millis() - _ultimoIntento < MANDO_REINTENTO_MS) return;
+  _ultimoIntento = millis();
+  conectar(MANDO_TIMEOUT_MS);
+}
+
 void imprimir();
 void imprimirQR(const char* datos, uint8_t modulo, uint8_t nivelEC);
 void imprimirGrafica();
@@ -933,7 +1056,7 @@ void mostrarEspera() {
 int leerAzul() {
   static bool estaba = false, largaEmitida = false;
   static unsigned long t0 = 0;
-  bool ahora = (digitalRead(pinImprimir) == LOW);
+  bool ahora = (azulActivo());
 
   if (ahora && !estaba) { estaba = true; largaEmitida = false; t0 = millis(); }
   else if (ahora && !largaEmitida && millis() - t0 >= PULSACION_LARGA_MS) {
@@ -949,7 +1072,7 @@ int leerAzul() {
 
 bool rojoPulsado() {
   static bool estaba = false;
-  bool ahora = (digitalRead(pinEmpezar) == LOW);
+  bool ahora = (rojoActivo());
   if (ahora && !estaba) { estaba = true; return true; }
   if (!ahora) estaba = false;
   return false;
@@ -957,7 +1080,9 @@ bool rojoPulsado() {
 
 // Evita que el boton que acaba de cerrar una pantalla dispare la siguiente
 void esperarSoltar(byte pin) {
-  while (digitalRead(pin) == LOW) delay(10);
+  // Espera tambien a que se suelte el boton equivalente del mando
+  if (pin == pinEmpezar) { while (rojoActivo()) delay(10); }
+  else                   { while (azulActivo()) delay(10); }
   delay(40);
 }
 
@@ -1008,7 +1133,7 @@ void mostrarMenu() {
   }
 
   u8g2.setFont(u8g2_font_4x6_tf);
-  const char* pie = "AZUL corto=mover largo=entrar";
+  const char* pie = "AZUL CORTO=MOVER LARGO=ENTRAR";
   u8g2.drawStr((128 - u8g2.getStrWidth(pie)) / 2, 63, pie);
   u8g2.sendBuffer();
 }
@@ -1097,7 +1222,7 @@ void mostrarDatos() {
   u8g2.drawStr(8, 56, notaPrueba[0] ? notaPrueba : "(vacio)");
 
   u8g2.setFont(u8g2_font_4x6_tf);
-  const char* pie = "largo=editar  ROJO=salir";
+  const char* pie = "LARGO=EDITAR  ROJO=SALIR";
   u8g2.drawStr((128 - u8g2.getStrWidth(pie)) / 2, 63, pie);
   u8g2.sendBuffer();
 }
@@ -1169,8 +1294,8 @@ void mostrarDetallePrueba() {
 
   u8g2.drawFrame(0, 55, 128, 1);
   u8g2.setFont(u8g2_font_4x6_tf);
-  u8g2.drawStr(0, 63, "rojo=volver");
-  const char* pie = "azul=imprimir";
+  u8g2.drawStr(0, 63, "ROJO=VOLVER");
+  const char* pie = "AZUL=IMPRIMIR";
   u8g2.drawStr(128 - u8g2.getStrWidth(pie), 63, pie);
   u8g2.sendBuffer();
 }
@@ -1325,10 +1450,14 @@ void mostrarHistorico() {
   // pulsaciones debajo, a la derecha.
   u8g2.drawFrame(0, 52, 128, 1);
   u8g2.setFont(u8g2_font_4x6_tf);
-  u8g2.drawStr(128 - u8g2.getStrWidth("azul"), 58, "azul");
-  u8g2.drawStr(0, 64, "rojo=salir");
-  const char* der = "corto=bajar largo=ver";
-  u8g2.drawStr(128 - u8g2.getStrWidth(der), 64, der);
+  // Tres columnas de 4x6: ROJO 0-40 px, CORTO 44-88, LARGO 92-128, con el
+  // rotulo AZUL centrado sobre cada una de sus dos pulsaciones.
+  int wAzul = u8g2.getStrWidth("AZUL");
+  u8g2.drawStr(44 + (44 - wAzul) / 2, 58, "AZUL");
+  u8g2.drawStr(92 + (36 - wAzul) / 2, 58, "AZUL");
+  u8g2.drawStr(0,  64, "ROJO=SALIR");
+  u8g2.drawStr(44, 64, "CORTO=BAJAR");
+  u8g2.drawStr(92, 64, "LARGO=VER");
   u8g2.sendBuffer();
 }
 
@@ -1354,7 +1483,7 @@ void mostrarPerifericos() {
   }
 
   u8g2.setFont(u8g2_font_4x6_tf);
-  const char* pie = "AZUL=cambiar  ROJO=salir";
+  const char* pie = "AZUL=CAMBIAR  ROJO=SALIR";
   u8g2.drawStr((128 - u8g2.getStrWidth(pie)) / 2, 63, pie);
   u8g2.sendBuffer();
 }
@@ -1686,6 +1815,12 @@ void setup() {
   impresoraSerie.begin();   // UART de la impresora por cable
   impresoraBLE.begin();     // arranca la pila BLE (no conecta todavia)
 
+  // Mando BLE: Just Works con bonding, y un primer intento de enlace. Si el
+  // mando esta apagado, esto bloquea el arranque el tiempo del timeout.
+  BLESecurity::setCapability(ESP_IO_CAP_NONE);
+  BLESecurity::setAuthenticationMode(true, false, true);
+  mando.conectar(2000);
+
 #if DIAGNOSTICO_BLE >= 1
   escanearBLE();
 #endif
@@ -1725,6 +1860,10 @@ void pruebaImpresion() {
 
 void loop() {
   atenderPuertoSerie();    // ordenes de la webapp por USB
+  // El intento de reconexion bloquea hasta MANDO_TIMEOUT_MS: nunca durante
+  // el arranque ni la medicion, donde estropearia el muestreo.
+  mando.mantener(estadoActual == ESPERA || estadoActual == HISTORICO ||
+                 estadoActual == RESULTADO);
   actualizarGPS();
   actualizarLedRGB();      // color de la placa segun la pantalla activa
   actualizarLedSensor();   // destello con cada pulso del rodillo
@@ -1747,14 +1886,14 @@ void loop() {
       mostrarEspera();
       digitalWrite(pinLedVerde, (millis() / 500) % 2);  // parpadeo cada 0,5 s
       digitalWrite(pinLedAzul, (millis() / 500) % 2);  // parpadeo cada 0,5 s
-      if (digitalRead(pinEmpezar) == LOW) {
+      if (rojoActivo()) {
         delay(500);
         digitalWrite(pinLedVerde,0);
         digitalWrite(pinLedAzul,0);
         iniciarArranque();
         estadoActual = ARRANQUE;
       }
-      if (digitalRead(pinImprimir) == LOW) {            // boton azul: historico
+      if (azulActivo()) {            // boton azul: historico
         digitalWrite(pinLedVerde, 0);
         digitalWrite(pinLedAzul,0);
         cargarListaPruebas();
@@ -1835,7 +1974,7 @@ void loop() {
     case ARRANQUE:
       digitalWrite(pinLedRojo, (millis() / 500) % 2);  // parpadeo cada 0,5 s
       ejecutarArranque();   // transita a MEDICION (velocidad alcanzada) o a ESPERA (timeout)
-      if (digitalRead(pinEmpezar) == LOW) {            // abortar arranque a mano
+      if (rojoActivo()) {            // abortar arranque a mano
         ledcWrite(pinMotor, 0);
         estadoActual = ESPERA;
         delay(500);
@@ -1846,7 +1985,7 @@ void loop() {
     case MEDICION:
       digitalWrite(pinLedRojo, 1);   // fijo durante la medida
       ejecutarMedida();              // pone estadoActual = RESULTADO al cumplirse tiempoPrueba
-      if (digitalRead(pinEmpezar) == LOW) {   // boton empezar: salir de la prueba a ESPERA
+      if (rojoActivo()) {   // boton empezar: salir de la prueba a ESPERA
         estadoActual = ESPERA;
         ledcWrite(pinMotor, 0);
         delay(500);
@@ -1858,13 +1997,13 @@ void loop() {
       digitalWrite(pinLedAzul,1);
       digitalWrite(pinLedRojo,1);
       ejecutarResultado();
-      if (digitalRead(pinEmpezar) == LOW) {
+      if (rojoActivo()) {
         delay(1000);
         estadoActual = ESPERA;
         digitalWrite(pinLedAzul,0);
         digitalWrite(pinLedRojo,0);
       }
-      if (digitalRead(pinImprimir) == LOW) {
+      if (azulActivo()) {
         delay(200);
         imprimir();
       }
@@ -1901,8 +2040,8 @@ void ejecutarResultado() {
   // Botonera, con el mismo patron que las demas pantallas
   u8g2.drawFrame(0, 55, 128, 1);
   u8g2.setFont(u8g2_font_4x6_tf);
-  u8g2.drawStr(0, 63, "rojo=salir");
-  const char* der = "azul=imprimir";
+  u8g2.drawStr(0, 63, "ROJO=SALIR");
+  const char* der = "AZUL=IMPRIMIR";
   u8g2.drawStr(128 - u8g2.getStrWidth(der), 63, der);
 
   u8g2.sendBuffer();
