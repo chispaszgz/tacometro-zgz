@@ -365,7 +365,7 @@ char notaPrueba[MAX_NOTA + 1]     = "";
 // FW_VERSION la cambias tu en cada version publicada; PROTO_VERSION solo
 // cuando el formato de las respuestas JSON deje de ser compatible, para que
 // la webapp pueda avisar en vez de fallar de forma rara.
-#define FW_VERSION    "1.4.2"
+#define FW_VERSION    "1.5.0"
 #define PROTO_VERSION 1
 #define MAX_ID_DISP   20
 char idDispositivo[MAX_ID_DISP + 1] = "";
@@ -783,7 +783,8 @@ void TecladoBLE::desconectar() {
 // Cada report ID va en su propia caracteristica 0x2A4D: hay que recorrerlas
 // POR HANDLE, porque el mapa por UUID de la libreria colapsa las repetidas.
 const char* NOMBRE_MANDO = "MUZHTEN";
-const char* MAC_MANDO    = "58:2b:37:58:86:78";
+#define MAC_MANDO_DEFECTO "58:2b:37:58:86:78"
+char macMando[18] = MAC_MANDO_DEFECTO;    // editable por USB (SETMANDO), en la NVS
 #define MANDO_TAP_X          501    // punto del toque del boton 1
 #define MANDO_TAP_Y          300
 #define MANDO_TAP_TOL        6      // tolerancia, en unidades del digitalizador
@@ -791,8 +792,8 @@ const char* MAC_MANDO    = "58:2b:37:58:86:78";
 #define MANDO_DOBLE_MS       350    // ventana para el doble clic del boton 2
 #define MANDO_PULSO_CORTO_MS 150    // duracion virtual de una pulsacion corta
 #define MANDO_PULSO_LARGO_MS 750    // > PULSACION_LARGA_MS: leerAzul() la ve larga
-#define MANDO_REINTENTO_MS   15000  // entre intentos de reconexion
-#define MANDO_TIMEOUT_MS     1500   // espera maxima por intento (bloquea el bucle)
+#define MANDO_REINTENTO_MS   8000   // entre intentos de reconexion
+#define MANDO_TIMEOUT_MS     4000   // espera maxima por intento (en su propia tarea)
 
 class MandoBLE {
 public:
@@ -800,11 +801,10 @@ public:
   bool rojo() { return (long)(_rojoHasta - millis()) > 0; }
   bool azul();
   bool conectar(uint32_t timeoutMs);
-  void mantener(bool permitido);          // reconexion periodica, llamar en el loop
+  void desconectar() { if (_cli && _cli->isConnected()) _cli->disconnect(); }
   static void alRecibir(BLERemoteCharacteristic* chr, uint8_t* d, size_t len, bool);
 private:
   BLEClient* _cli = nullptr;
-  unsigned long _ultimoIntento = 0;
   static uint16_t _hConsumidor, _hTactil;
   static volatile unsigned long _rojoHasta, _azulHasta;
   static volatile uint8_t _clicsAzul;         // clics del boton 2 pendientes de resolver
@@ -881,7 +881,7 @@ bool MandoBLE::conectar(uint32_t timeoutMs) {
 
   // Conexion directa a su direccion, sin rastrear: si el mando esta dormido,
   // connect() agota el tiempo y se vuelve a intentar mas tarde.
-  if (!_cli->connect(BLEAddress(String(MAC_MANDO)), 0, timeoutMs)) return false;
+  if (!_cli->connect(BLEAddress(String(macMando)), 0, timeoutMs)) return false;
   if (!_cli->secureConnection()) { _cli->disconnect(); return false; }
 
   BLERemoteService* svc = _cli->getService(BLEUUID(String(UUID_HID_SVC)));
@@ -908,12 +908,35 @@ bool MandoBLE::conectar(uint32_t timeoutMs) {
   return true;
 }
 
-void MandoBLE::mantener(bool permitido) {
-  if (conectado() || !permitido) return;
-  if (millis() - _ultimoIntento < MANDO_REINTENTO_MS) return;
-  _ultimoIntento = millis();
-  conectar(MANDO_TIMEOUT_MS);
+// --- Tarea del mando ---------------------------------------------------
+// Toda la conexion BLE del mando vive en una tarea FreeRTOS aparte: sus
+// esperas (que pueden ser largas si el mando esta apagado) no tocan nunca la
+// pantalla ni el muestreo. La tarea solo lo intenta en pantallas sin exigencia
+// de tiempo real, y se aparta mientras la impresora usa el BLE.
+volatile bool mandoPermitido = true;   // lo baja imprimir() mientras conecta la impresora
+volatile bool mandoOcupado   = false;  // true mientras hay un intento en curso
+
+void tareaMando(void*) {
+  vTaskDelay(pdMS_TO_TICKS(6000));     // que la bienvenida salga sin competencia
+  for (;;) {
+    bool pantallaTranquila = (estadoActual == ESPERA || estadoActual == HISTORICO ||
+                              estadoActual == RESULTADO);
+    if (!mando.conectado() && mandoPermitido && pantallaTranquila) {
+      mandoOcupado = true;
+      mando.conectar(MANDO_TIMEOUT_MS);
+      mandoOcupado = false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(mando.conectado() ? 1000 : MANDO_REINTENTO_MS));
+  }
 }
+
+// Para que la impresora conecte sin solaparse con un intento del mando
+void apartarMando() {
+  mandoPermitido = false;
+  unsigned long t0 = millis();
+  while (mandoOcupado && millis() - t0 < MANDO_TIMEOUT_MS + 2000) delay(10);
+}
+void liberarMando() { mandoPermitido = true; }
 
 void imprimir();
 void imprimirQR(const char* datos, uint8_t modulo, uint8_t nivelEC);
@@ -1050,7 +1073,7 @@ void mostrarEspera() {
     int puntos = 1 + (millis() / 400) % 3;
     snprintf(buf, sizeof(buf), "GPS: buscando%.*s", puntos, "...");
   }
-  u8g2.drawStr(0, 9, buf);
+  u8g2.drawStr(0, 8, buf);
 
   // --- FECHA y HORA ---
   // "FECHA: Miercoles 23/02/26" son 25 caracteres: el maximo que entra en 5x7.
@@ -1058,12 +1081,21 @@ void mostrarEspera() {
     calcularHoraLocal();
     snprintf(buf, sizeof(buf), "FECHA: %s %02d/%02d/%02d",
              nombreDiaSemana(localDiaSemana), localDia, localMes, localAnio % 100);
-    u8g2.drawStr(0, 21, buf);
+    u8g2.drawStr(0, 17, buf);
     snprintf(buf, sizeof(buf), "HORA:  %02d:%02d:%02d", localHora, localMin, localSeg);
-    u8g2.drawStr(0, 34, buf);
+    u8g2.drawStr(0, 26, buf);
   } else {
-    u8g2.drawStr(0, 21, "FECHA: --/--/--");
-    u8g2.drawStr(0, 34, "HORA:  --:--:--");
+    u8g2.drawStr(0, 17, "FECHA: --/--/--");
+    u8g2.drawStr(0, 26, "HORA:  --:--:--");
+  }
+
+  // --- MANDO AUXILIAR ---
+  if (mando.conectado()) {
+    u8g2.drawStr(0, 35, "MANDO AUX: conectado");
+  } else {
+    int puntos = 1 + (millis() / 400) % 3;
+    snprintf(buf, sizeof(buf), "MANDO AUX: conectando%.*s", puntos, "...");
+    u8g2.drawStr(0, 35, buf);
   }
 
   u8g2.drawFrame(0, 44, 128, 1);
@@ -1542,6 +1574,7 @@ void mostrarPerifericos() {
 //   SETAG <texto>     cambia el agente
 //   SETNOTA <texto>   cambia la nota
 //   SETIMP <tipo>     cambia la impresora: "cable" o "bluetooth"
+//   SETMANDO <mac>    cambia la direccion BLE del mando auxiliar
 #define MAX_CMD 96
 
 static const char B64[] =
@@ -1573,6 +1606,15 @@ void copiarCampo(char* dest, size_t maxLen, const char* src) {
     dest[n++] = toupper((unsigned char)c);
   }
   dest[n] = '\0';
+}
+
+bool macValida(const char* m) {
+  if (strlen(m) != 17) return false;
+  for (int i = 0; i < 17; i++) {
+    if (i % 3 == 2) { if (m[i] != ':') return false; }
+    else if (!isxdigit((unsigned char)m[i])) return false;
+  }
+  return true;
 }
 
 void macBase(char* dest, size_t tam) {
@@ -1700,6 +1742,8 @@ void cmdCfg() {
   Serial.print(",\"nota\":");   jsonCadena(notaPrueba);
   Serial.print(",\"impresora\":");
   jsonCadena(tipoImpresora == IMP_CABLE ? "cable" : "bluetooth");
+  Serial.print(",\"mando\":"); jsonCadena(macMando);
+  Serial.printf(",\"mandoConectado\":%s", mando.conectado() ? "true" : "false");
   Serial.println("}");
 }
 
@@ -1729,6 +1773,17 @@ void ejecutarComando(char* linea) {
   else if (!strcmp(linea, "SETNOTA")) {
     copiarCampo(notaPrueba, MAX_NOTA, arg);
     prefs.putString("nota", notaPrueba);
+    cmdCfg();
+  }
+  else if (!strcmp(linea, "SETMANDO")) {
+    // Formato xx:xx:xx:xx:xx:xx; se guarda en minusculas
+    if (!macValida(arg)) { respError("SETMANDO", "formato: xx:xx:xx:xx:xx:xx"); return; }
+    for (char* q = arg; *q; q++) *q = tolower((unsigned char)*q);
+    bool cambia = strcmp(arg, macMando) != 0;
+    strncpy(macMando, arg, sizeof(macMando) - 1);
+    macMando[sizeof(macMando) - 1] = 0;
+    prefs.putString("mando", macMando);
+    if (cambia) mando.desconectar();     // la tarea reconectara con la nueva
     cmdCfg();
   }
   else if (!strcmp(linea, "SETIMP")) {
@@ -1848,11 +1903,12 @@ void setup() {
   impresoraSerie.begin();   // UART de la impresora por cable
   impresoraBLE.begin();     // arranca la pila BLE (no conecta todavia)
 
-  // Mando BLE: Just Works con bonding, y un primer intento de enlace. Si el
-  // mando esta apagado, esto bloquea el arranque el tiempo del timeout.
+  // Mando BLE: Just Works con bonding. La conexion se hace en su propia tarea
+  // y nunca bloquea: el arranque sigue y la pantalla de espera informa.
   BLESecurity::setCapability(ESP_IO_CAP_NONE);
   BLESecurity::setAuthenticationMode(true, false, true);
-  mando.conectar(2000);
+  prefs.getString("mando", MAC_MANDO_DEFECTO).toCharArray(macMando, sizeof(macMando));
+  xTaskCreate(tareaMando, "mando", 8192, nullptr, 1, nullptr);
 
 #if DIAGNOSTICO_BLE >= 1
   escanearBLE();
@@ -1893,10 +1949,6 @@ void pruebaImpresion() {
 
 void loop() {
   atenderPuertoSerie();    // ordenes de la webapp por USB
-  // El intento de reconexion bloquea hasta MANDO_TIMEOUT_MS: nunca durante
-  // el arranque ni la medicion, donde estropearia el muestreo.
-  mando.mantener(estadoActual == ESPERA || estadoActual == HISTORICO ||
-                 estadoActual == RESULTADO);
   actualizarGPS();
   actualizarLedRGB();      // color de la placa segun la pantalla activa
   actualizarLedSensor();   // destello con cada pulso del rodillo
@@ -2085,6 +2137,7 @@ void ejecutarResultado() {
 void imprimir() {
   // Conectar con la impresora si todavia no lo esta
   if (!impresora->conectado()) {
+    apartarMando();                       // que no se solape con un intento del mando
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_6x10_tf);
     u8g2.drawStr((128 - u8g2.getStrWidth("Conectando...")) / 2, 35, "Conectando...");

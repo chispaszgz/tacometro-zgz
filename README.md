@@ -44,6 +44,7 @@ almacenadas se conservan** al actualizar.
 | `CFG` | agente, nota y tipo de impresora |
 | `SETID` / `SETAG` / `SETNOTA` | escritura de esos campos |
 | `SETIMP cable|bluetooth` | elige la impresora |
+| `SETMANDO <mac>` | dirección BLE del mando auxiliar |
 
 Las trazas de depuración del firmware salen por el mismo puerto, así que
 cualquier línea que no empiece por `{` debe ignorarse.

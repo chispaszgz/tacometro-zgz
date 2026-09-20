@@ -137,6 +137,8 @@
     <div class="campo"><label for="fId">ID</label><input id="fId" maxlength="20"><button data-cmd="SETID" data-campo="fId">Guardar</button></div>
     <div class="campo"><label for="fAgente">Agente</label><input id="fAgente" maxlength="16"><button data-cmd="SETAG" data-campo="fAgente">Guardar</button></div>
     <div class="campo"><label for="fNota">Nota</label><input id="fNota" maxlength="22"><button data-cmd="SETNOTA" data-campo="fNota">Guardar</button></div>
+    <div class="campo"><label for="fMando">Mando BLE</label><input id="fMando" maxlength="17" placeholder="xx:xx:xx:xx:xx:xx" spellcheck="false"><button data-cmd="SETMANDO" data-campo="fMando">Guardar</button></div>
+    <div class="dato"><span>Mando auxiliar</span><span id="vMando">—</span></div>
     <div class="dato"><span>Impresora seleccionada</span><span id="vImpresora">—</span></div>
   </section>
 
@@ -369,6 +371,8 @@ function pintarCfg(d) {
   $("fAgente").value = d.agente || "";
   $("fNota").value = d.nota || "";
   $("vImpresora").textContent = d.impresora === "cable" ? "Cable (serie TTL)" : "Bluetooth (BLE)";
+  $("fMando").value = d.mando || "";
+  $("vMando").textContent = d.mandoConectado ? "conectado (" + (d.mando || "") + ")" : "sin conexión";
 }
 
 function pintarPruebas(lista) {
@@ -598,7 +602,9 @@ for (const b of document.querySelectorAll("button[data-cmd]")) {
   b.onclick = async () => {
     const valor = $(b.dataset.campo).value.trim();
     try {
-      pintarCfg(await enviar(b.dataset.cmd + " " + valor));
+      const r = await enviar(b.dataset.cmd + " " + valor);
+      if (!r.ok) { log("✗ " + (r.error || "rechazado")); pintarCfg(await enviar("CFG")); return; }
+      pintarCfg(r);
       log("✓ guardado");
     } catch (e) { log("✗ " + e.message); }
   };
